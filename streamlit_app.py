@@ -228,15 +228,15 @@ with tab1:
     st.subheader("A) Message Passing — PPT sequence style")
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        msgs = st.number_input("Messages", 1, 20, 6)
+        msgs = st.number_input("Messages", 1, 20, 6, key="mp_msgs")
     with c2:
-        loss = st.slider("Loss", 0.0, 1.0, 0.2, 0.01)
+        loss = st.slider("Loss", 0.0, 1.0, 0.2, 0.01, key="mp_loss")
     with c3:
-        dup = st.slider("Duplicate", 0.0, 1.0, 0.1, 0.01)
+        dup = st.slider("Duplicate", 0.0, 1.0, 0.1, 0.01, key="mp_dup")
     with c4:
-        reorder = st.slider("Reorder", 0.0, 1.0, 0.2, 0.01)
+        reorder = st.slider("Reorder", 0.0, 1.0, 0.2, 0.01, key="mp_reorder")
     with c5:
-        speed = st.slider("Speed", 0.2, 2.0, 1.0, 0.1)
+        speed = st.slider("Speed", 0.2, 2.0, 1.0, 0.1, key="rel_speed")
 
     if st.button("▶ Animate Message Passing"):
         animate_message_passing(loss=loss, dup=dup, reorder=reorder, msgs=msgs, speed=speed)
@@ -247,11 +247,11 @@ with tab2:
     with c1:
         protocol = st.selectbox("Protocol", ["R", "RR", "RRA"])
     with c2:
-        calls = st.number_input("Calls", 1, 15, 4)
+        calls = st.number_input("Calls", 1, 15, 4, key="rel_calls")
     with c3:
-        p_req_loss = st.slider("Req loss", 0.0, 1.0, 0.25, 0.01)
+        p_req_loss = st.slider("Req loss", 0.0, 1.0, 0.25, 0.01, key="rel_req_loss")
     with c4:
-        p_reply_loss = st.slider("Reply/ACK loss", 0.0, 1.0, 0.25, 0.01)
+        p_reply_loss = st.slider("Reply/ACK loss", 0.0, 1.0, 0.25, 0.01, key="rel_reply_loss")
     with c5:
         speed = st.slider("Speed", 0.2, 2.0, 1.0, 0.1)
 
