@@ -1,262 +1,258 @@
 
 import streamlit as st
 import random
-import time
 import math
-import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrow, Rectangle, Circle
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="IPC Lecture — PPT-style Animations", page_icon="📽️", layout="wide")
+st.set_page_config(page_title="IPC Lecture — Plotly Animations", page_icon="🎞️", layout="wide")
+st.title("🎞️ IPC & RPC — Smooth Plotly Animations")
+st.caption("PPT-style lifelines with real, smooth animations (Plotly frames).")
 
-st.title("📽️ IPC & RPC — PPT-style Animations")
-st.caption("Animations drawn to resemble the lecture's sequence diagrams and protocol figures.")
+# ---------- Common drawing helpers ----------
+X_CLIENT = 0.2
+X_SERVER = 0.8
+Y_TOP = 0.95
+Y_BOTTOM = 0.05
 
-# -------------------------- Drawing helpers (PPT style) --------------------------
-
-def draw_lifelines(ax, labels=("Client", "Server")):
-    ax.clear()
-    ax.set_xlim(0, 10)
-    ax.set_ylim(0, 10)
-    ax.axis("off")
-
-    # Columns at x=2.5 and x=7.5 (like PPT diagrams)
-    x_client, x_server = 2.5, 7.5
+def base_fig(title=""):
+    fig = go.Figure()
+    # Lifelines
+    fig.add_shape(type="line", x0=X_CLIENT, y0=Y_TOP-0.05, x1=X_CLIENT, y1=Y_BOTTOM+0.05,
+                  line=dict(color="black", width=2, dash="dash"))
+    fig.add_shape(type="line", x0=X_SERVER, y0=Y_TOP-0.05, x1=X_SERVER, y1=Y_BOTTOM+0.05,
+                  line=dict(color="black", width=2, dash="dash"))
     # Header boxes
-    ax.add_patch(Rectangle((x_client-1.6, 9.2), 3.2, 0.9, ec="black", fc="white"))
-    ax.text(x_client, 9.65, labels[0], ha="center", va="center", fontsize=12, fontweight="bold")
-    ax.add_patch(Rectangle((x_server-1.6, 9.2), 3.2, 0.9, ec="black", fc="white"))
-    ax.text(x_server, 9.65, labels[1], ha="center", va="center", fontsize=12, fontweight="bold")
+    fig.add_shape(type="rect", x0=X_CLIENT-0.1, y0=Y_TOP-0.03, x1=X_CLIENT+0.1, y1=Y_TOP+0.02,
+                  line=dict(color="black"), fillcolor="white")
+    fig.add_annotation(x=X_CLIENT, y=Y_TOP-0.005, text="Client", showarrow=False, font=dict(size=14))
+    fig.add_shape(type="rect", x0=X_SERVER-0.1, y0=Y_TOP-0.03, x1=X_SERVER+0.1, y1=Y_TOP+0.02,
+                  line=dict(color="black"), fillcolor="white")
+    fig.add_annotation(x=X_SERVER, y=Y_TOP-0.005, text="Server", showarrow=False, font=dict(size=14))
 
-    # Lifelines (dashed)
-    ax.plot([x_client, x_client], [9.2, 0.8], linestyle="--", color="black")
-    ax.plot([x_server, x_server], [9.2, 0.8], linestyle="--", color="black")
-    return x_client, x_server
+    fig.update_xaxes(visible=False, range=[0,1])
+    fig.update_yaxes(visible=False, range=[0,1])
+    fig.update_layout(margin=dict(l=20,r=20,t=40,b=20), height=480, title=title)
+    return fig
 
-def arrow(ax, x0, y0, x1, y1, text, style="solid", hollow=False, color="black"):
-    lw = 1.8
-    ls = "-" if style == "solid" else "--"
-    head_w, head_l = 0.25, 0.35
-    # FancyArrow draws a thick arrow; we emulate PPT look with a line + head
-    ax.add_patch(FancyArrow(x0, y0, x1-x0, y1-y0, width=0.001, length_includes_head=True,
-                            head_width=head_w, head_length=head_l, color=color, linestyle=ls, linewidth=lw,
-                            fill=True))
-    # Label
-    xm = (x0 + x1) / 2
-    ym = (y0 + y1) / 2 + 0.25
-    ax.text(xm, ym, text, ha="center", va="bottom", fontsize=11, bbox=dict(fc="white", ec="none", pad=2))
-
-def cross(ax, x, y, size=0.35, color="crimson"):
-    ax.plot([x-size, x+size], [y-size, y+size], color=color, linewidth=2)
-    ax.plot([x-size, x+size], [y+size, y-size], color=color, linewidth=2)
-
-def play_frames(num, sleep):
-    for i in range(num):
-        yield i
-        time.sleep(sleep)
-
-# -------------------------- A) Message Passing (like slides 32–34) --------------------------
-
-def animate_message_passing(loss=0.2, dup=0.1, reorder=0.2, msgs=5, speed=1.0):
-    fig, ax = plt.subplots(figsize=(8, 5))
-    xc, xs = draw_lifelines(ax)
-
-    y = 8.6
-    timeline_gap = 1.3 / max(0.35, speed)
-
-    # Build a transmission plan (requests from client to server)
+def make_frames_for_messages(n_msgs=6, p_drop=0.2, p_dup=0.1, p_reorder=0.2, speed=1.0, seed=42):
+    rnd = random.Random(seed)
+    lane_gap = 0.1
+    y = 0.85
     plan = []
-    rnd = random.Random(42)
-    for seq in range(1, msgs+1):
-        copies = 1 + (1 if rnd.random() < dup else 0)
+    for seq in range(1, n_msgs+1):
+        copies = 1 + (1 if rnd.random() < p_dup else 0)
         for c in range(copies):
-            drop = rnd.random() < loss
-            jitter = 0.0 if rnd.random() > reorder else rnd.random() * 0.8
-            plan.append({"seq": seq, "copy": c, "drop": drop, "jitter": jitter})
-    # Reorder by jitter to simulate wire scheduling
+            drop = rnd.random() < p_drop
+            jitter = rnd.random() * p_reorder
+            plan.append({"seq": seq, "copy": c, "drop": drop, "jitter": jitter, "y": y})
+        y -= lane_gap
     plan.sort(key=lambda m: m["jitter"])
 
     frames = []
+    data_traces = []  # we'll keep a single moving trace
+    # static symbols legend
+    legend = go.Scatter(x=[None], y=[None], mode="markers", name="Request",
+                        marker=dict(symbol="triangle-right", size=14, color="black"))
+    legend2 = go.Scatter(x=[None], y=[None], mode="markers", name="Reply",
+                        marker=dict(symbol="triangle-left", size=14, color="black"))
+    legend3 = go.Scatter(x=[None], y=[None], mode="markers", name="Drop ✕",
+                        marker=dict(symbol="x-thin", size=14, color="crimson"))
+    # Build frames
+    t_idx = 0
+    frames.append(go.Frame(name=f"start_{t_idx}", data=[legend, legend2, legend3]))
     for item in plan:
-        # Request arrow animation frames (left to right)
-        steps = 10
+        # Request frames (client→server)
+        steps = int(20 * speed)
         for k in range(steps+1):
             t = k/steps
-            fig, ax = plt.subplots(figsize=(8, 5))
-            xc, xs = draw_lifelines(ax)
-            # Already completed messages (previous arrows)
-            y_completed = y
-            for p in frames:
-                # draw frozen frame contents
-                arrow(ax, p["x0"], p["y0"], p["x1"], p["y1"], p["label"], style="solid")
-            # Current moving head
-            x0, y0 = xc, y
-            x1, y1 = xc + (xs - xc) * t, y
-            # Fading if drop
-            color = "0.3" if item["drop"] else "black"
-            arrow(ax, x0, y0, x1, y1, f"request #{item['seq']}", style="solid", color=color)
-            st.pyplot(fig)
-            plt.close(fig)
-            time.sleep(0.05 / max(0.2, speed))
-        # If not dropped, draw reply (right to left)
-        if not item["drop"]:
-            # freeze the request
-            frames.append({"x0": xc, "y0": y, "x1": xs, "y1": y, "label": f"request #{item['seq']}"})
-            for k in range(10+1):
-                t = k/10
-                fig, ax = plt.subplots(figsize=(8, 5))
-                xc, xs = draw_lifelines(ax)
-                for p in frames:
-                    arrow(ax, p["x0"], p["y0"], p["x1"], p["y1"], p["label"], style="solid")
-                x0, y0 = xs, y-0.5
-                x1, y1 = xs - (xs - xc) * t, y-0.5
-                arrow(ax, x0, y0, x1, y1, f"reply #{item['seq']}", style="solid")
-                st.pyplot(fig)
-                plt.close(fig)
-                time.sleep(0.05 / max(0.2, speed))
-            frames.append({"x0": xs, "y0": y-0.5, "x1": xc, "y1": y-0.5, "label": f"reply #{item['seq']}"})
+            x = X_CLIENT + (X_SERVER - X_CLIENT) * t
+            y = item["y"]
+            # Fade if drop
+            opacity = 0.35 + 0.65*(1.0 - t) if item["drop"] else 1.0
+            req = go.Scatter(x=[x], y=[y], mode="markers",
+                             marker=dict(symbol="triangle-right", size=16, color="black", opacity=opacity),
+                             showlegend=False)
+            frames.append(go.Frame(name=f"f{t_idx}", data=[legend, legend2, legend3, req]))
+            t_idx += 1
+        if item["drop"]:
+            # show X near server
+            dropx = X_SERVER - 0.02
+            dxy = go.Scatter(x=[dropx], y=[item["y"]], mode="markers",
+                             marker=dict(symbol="x-thin", size=18, color="crimson"), showlegend=False)
+            frames.append(go.Frame(name=f"drop_{t_idx}", data=[legend, legend2, legend3, dxy]))
+            t_idx += 1
         else:
-            # Mark drop with a red cross near the server side
-            fig, ax = plt.subplots(figsize=(8, 5))
-            xc, xs = draw_lifelines(ax)
-            for p in frames:
-                arrow(ax, p["x0"], p["y0"], p["x1"], p["y1"], p["label"], style="solid")
-            cross(ax, xs-0.4, y, size=0.28)
-            ax.text(5, y+0.4, "dropped", ha="center", color="crimson")
-            st.pyplot(fig)
-            plt.close(fig)
-        y -= timeline_gap
-
-    st.info("This mirrors the slide style: solid arrows for messages, lifelines for Client/Server, red ✕ for drops, optional duplicates & reorder simulated.")
-
-# -------------------------- B) Reliability Protocols (slides 36–38) --------------------------
-
-def animate_reliability(protocol="RR", p_req_loss=0.25, p_reply_loss=0.25, retries=2, calls=4, speed=1.0):
-    rnd = random.Random(7)
-    for seq in range(1, calls+1):
-        fig, ax = plt.subplots(figsize=(8, 5))
-        xc, xs = draw_lifelines(ax)
-        ax.text(5, 9.0, f"Call #{seq} — Protocol: {protocol}", ha="center", fontsize=12, fontweight="bold")
-
-        y = 8.2
-        step_h = 1.5 / max(0.35, speed)
-        attempts = 0
-        server_execs = 0
-        done = False
-        got_reply = False
-        acked = False
-
-        def anim_one_arrow(x0, y0, x1, y1, label, dropped=False):
-            steps = 10
+            # Reply frames (server→client)
+            steps = int(20 * speed)
             for k in range(steps+1):
                 t = k/steps
-                fig, ax = plt.subplots(figsize=(8, 5))
-                draw_lifelines(ax, labels=("Client", "Server"))
-                ax.text(5, 9.0, f"Call #{seq} — Protocol: {protocol}", ha="center", fontsize=12, fontweight="bold")
-                # draw all previous fixed arrows
-                for f in fixed:
-                    arrow(ax, *f["coords"], f["label"])
-                # moving arrow
-                color = "0.3" if dropped else "black"
-                ax.add_patch(FancyArrow(x0, y0, (x1-x0)*t, (y1-y0)*t, width=0.001,
-                                        length_includes_head=True, head_width=0.25, head_length=0.35,
-                                        color=color))
-                ax.text((x0+x1)/2, (y0+y1)/2 + 0.25, label, ha="center", bbox=dict(fc="white", ec="none", pad=2))
-                st.pyplot(fig); plt.close(fig)
-                time.sleep(0.05 / max(0.2, speed))
+                x = X_SERVER - (X_SERVER - X_CLIENT) * t
+                y = item["y"] - 0.05
+                rep = go.Scatter(x=[x], y=[y], mode="markers",
+                                 marker=dict(symbol="triangle-left", size=16, color="black"),
+                                 showlegend=False)
+                frames.append(go.Frame(name=f"f{t_idx}", data=[legend, legend2, legend3, rep]))
+                t_idx += 1
+    return frames
 
-        fixed = []
-        if protocol == "R":
+def make_frames_for_protocol(proto="RR", calls=4, p_req_loss=0.25, p_rep_loss=0.25, retries=2, speed=1.0, seed=7):
+    rnd = random.Random(seed)
+    frames = []
+    legend_req = go.Scatter(x=[None], y=[None], mode="markers", name="Request",
+                            marker=dict(symbol="triangle-right", size=14, color="black"))
+    legend_rep = go.Scatter(x=[None], y=[None], mode="markers", name="Reply",
+                            marker=dict(symbol="triangle-left", size=14, color="black"))
+    legend_ack = go.Scatter(x=[None], y=[None], mode="markers", name="ACK",
+                            marker=dict(symbol="triangle-right", size=14, color="green"))
+    legend_drop = go.Scatter(x=[None], y=[None], mode="markers", name="Drop ✕",
+                             marker=dict(symbol="x-thin", size=14, color="crimson"))
+    frames.append(go.Frame(name="start", data=[legend_req, legend_rep, legend_ack, legend_drop]))
+    y = 0.85
+    step = 0.18
+    t_idx = 0
+    for call in range(1, calls+1):
+        attempts = 0
+        got_reply = False
+        acked = False
+        server_execs = 0
+
+        def move(symbol, left_to_right=True, yy=y, color="black"):
+            nonlocal t_idx
+            steps = int(18 * speed)
+            for k in range(steps+1):
+                t = k/steps
+                x = X_CLIENT + (X_SERVER - X_CLIENT)*t if left_to_right else X_SERVER - (X_SERVER - X_CLIENT)*t
+                m = go.Scatter(x=[x], y=[yy], mode="markers",
+                               marker=dict(symbol=symbol, size=16, color=color), showlegend=False)
+                frames.append(go.Frame(name=f"p{t_idx}", data=[legend_req, legend_rep, legend_ack, legend_drop, m]))
+                t_idx += 1
+
+        def cross(yy=y):
+            nonlocal t_idx
+            d = go.Scatter(x=[X_SERVER-0.02], y=[yy], mode="markers",
+                           marker=dict(symbol="x-thin", size=18, color="crimson"), showlegend=False)
+            frames.append(go.Frame(name=f"drop{t_idx}", data=[legend_req, legend_rep, legend_ack, legend_drop, d]))
+            t_idx += 1
+
+        # Title frame for each call
+        title_ann = f"{proto} — Call #{call}"
+        frames.append(go.Frame(name=f"title{t_idx}", data=[legend_req, legend_rep, legend_ack, legend_drop],
+                               layout=go.Layout(title=title_ann)))
+        t_idx += 1
+
+        if proto == "R":
             attempts = 1
             # Request
             lost_req = rnd.random() < p_req_loss
-            anim_one_arrow(xc, y, xs, y, "request", dropped=lost_req)
+            move("triangle-right", True, y, "black")
             if lost_req:
-                # show drop cross
-                fig, ax = plt.subplots(figsize=(8, 5)); draw_lifelines(ax)
-                cross(ax, xs-0.4, y, size=0.28)
-                ax.text(5, y+0.4, "dropped", ha="center", color="crimson")
-                st.pyplot(fig); plt.close(fig)
+                cross(y)
             else:
                 server_execs += 1
-            # No reply by design; client cannot know → may timeout in app layer
-            st.warning("R (request-only): 'maybe' semantics. Client never knows for sure.")
-        elif protocol == "RR":
+            y -= step
+
+        elif proto == "RR":
             while attempts <= retries and not got_reply:
                 attempts += 1
                 lost_req = rnd.random() < p_req_loss
-                anim_one_arrow(xc, y, xs, y, f"request (try {attempts})", dropped=lost_req)
-                fixed.append({"coords": (xc, y, xs, y), "label": f"request (try {attempts})"})
+                move("triangle-right", True, y, "black")
                 if not lost_req:
                     server_execs += 1
-                    lost_reply = rnd.random() < p_reply_loss
-                    anim_one_arrow(xs, y-0.5, xc, y-0.5, "reply", dropped=lost_reply)
-                    if not lost_reply:
+                    lost_rep = rnd.random() < p_rep_loss
+                    move("triangle-left", False, y-0.05, "black")
+                    if not lost_rep:
                         got_reply = True
-                y -= step_h
-            if got_reply:
-                st.success("RR: client received reply → at-least-once (dedup needed to avoid duplicates).")
-            else:
-                st.warning("RR: no reply after retries → client times out (but server may have executed).")
+                else:
+                    cross(y)
+                y -= step
+
         else:  # RRA
             while attempts <= retries and not acked:
                 attempts += 1
                 lost_req = rnd.random() < p_req_loss
-                anim_one_arrow(xc, y, xs, y, f"request (try {attempts})", dropped=lost_req)
-                fixed.append({"coords": (xc, y, xs, y), "label": f"request (try {attempts})"})
+                move("triangle-right", True, y, "black")
                 if not lost_req:
                     server_execs += 1
-                    lost_reply = rnd.random() < p_reply_loss
-                    anim_one_arrow(xs, y-0.5, xc, y-0.5, "reply", dropped=lost_reply)
-                    if not lost_reply:
-                        lost_ack = rnd.random() < p_reply_loss
-                        anim_one_arrow(xc, y-1.0, xs, y-1.0, "ack", dropped=lost_ack)
+                    lost_rep = rnd.random() < p_rep_loss
+                    move("triangle-left", False, y-0.05, "black")
+                    if not lost_rep:
+                        lost_ack = rnd.random() < p_rep_loss
+                        move("triangle-right", True, y-0.10, "green")  # ACK client→server
                         if not lost_ack:
                             acked = True
-                y -= step_h
-            if acked:
-                st.success("RRA: reply + ACK observed → approximates exactly-once (with IDs & dedup).")
-            else:
-                st.warning("RRA: still uncertain if ACK lost — server may have executed multiple times.")
+                else:
+                    cross(y)
+                y -= step
 
-        st.info(f"Server executions for this call: {server_execs}.  Duplicates possible if multiple requests arrived.")
+        # summary frame note
+        note = f"Server executions this call: {server_execs}"
+        frames.append(go.Frame(name=f"sum{t_idx}", data=[legend_req, legend_rep, legend_ack, legend_drop],
+                               layout=go.Layout(title=title_ann + "  •  " + note)))
+        t_idx += 1
 
-# -------------------------- UI --------------------------
+    return frames
 
-tab1, tab2 = st.tabs(["A) Message Passing", "B) Reliability Protocols"])
+# ---------- UI ----------
+
+tab1, tab2 = st.tabs(["A) Message Passing (animated)", "B) Reliability Protocols (animated)"])
 
 with tab1:
-    st.subheader("A) Message Passing — PPT sequence style")
+    st.subheader("A) Message Passing — drops, duplicates, reorder (like slides 32–34)")
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        msgs = st.number_input("Messages", 1, 20, 6, key="mp_msgs")
+        n_msgs = st.number_input("Messages", 1, 20, 6, key="mp_n")
     with c2:
-        loss = st.slider("Loss", 0.0, 1.0, 0.2, 0.01, key="mp_loss")
+        p_drop = st.slider("Loss", 0.0, 1.0, 0.2, 0.01, key="mp_loss")
     with c3:
-        dup = st.slider("Duplicate", 0.0, 1.0, 0.1, 0.01, key="mp_dup")
+        p_dup = st.slider("Duplicate", 0.0, 1.0, 0.1, 0.01, key="mp_dup")
     with c4:
-        reorder = st.slider("Reorder", 0.0, 1.0, 0.2, 0.01, key="mp_reorder")
+        p_reorder = st.slider("Reorder", 0.0, 1.0, 0.2, 0.01, key="mp_reo")
     with c5:
-        speed = st.slider("Speed", 0.2, 2.0, 1.0, 0.1, key="rel_speed")
+        speed = st.slider("Speed", 0.5, 3.0, 1.0, 0.1, key="mp_spd")
 
-    if st.button("▶ Animate Message Passing"):
-        animate_message_passing(loss=loss, dup=dup, reorder=reorder, msgs=msgs, speed=speed)
+    if st.button("▶ Build animation", key="mp_btn"):
+        frames = make_frames_for_messages(n_msgs, p_drop, p_dup, p_reorder, speed)
+        fig = base_fig("Message Passing")
+        fig.frames = frames
+        fig.update_layout(
+            updatemenus=[
+                dict(type="buttons",
+                     buttons=[
+                         dict(label="Play", method="animate", args=[None, {"frame": {"duration": 60, "redraw": True}, "fromcurrent": True}]),
+                         dict(label="Pause", method="animate", args=[[None], {"mode": "immediate", "frame": {"duration": 0, "redraw": False}}]),
+                     ],
+                     direction="left", x=0.5, y=-0.05, xanchor="center", yanchor="top")
+            ]
+        )
+        st.plotly_chart(fig, use_container_width=True, theme=None)
 
 with tab2:
-    st.subheader("B) Reliability Protocols — R / RR / RRA (like slides 36–38)")
+    st.subheader("B) Reliability Protocols — R, RR, RRA (slides 36–38)")
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        protocol = st.selectbox("Protocol", ["R", "RR", "RRA"])
+        proto = st.selectbox("Protocol", ["R", "RR", "RRA"], key="rp_proto")
     with c2:
-        calls = st.number_input("Calls", 1, 15, 4, key="rel_calls")
+        calls = st.number_input("Calls", 1, 15, 4, key="rp_calls")
     with c3:
-        p_req_loss = st.slider("Req loss", 0.0, 1.0, 0.25, 0.01, key="rel_req_loss")
+        p_req_loss = st.slider("Req loss", 0.0, 1.0, 0.25, 0.01, key="rp_rloss")
     with c4:
-        p_reply_loss = st.slider("Reply/ACK loss", 0.0, 1.0, 0.25, 0.01, key="rel_reply_loss")
+        p_rep_loss = st.slider("Reply/ACK loss", 0.0, 1.0, 0.25, 0.01, key="rp_reploss")
     with c5:
-        speed = st.slider("Speed", 0.2, 2.0, 1.0, 0.1)
+        speed2 = st.slider("Speed", 0.5, 3.0, 1.0, 0.1, key="rp_spd")
 
-    if st.button("▶ Animate Reliability"):
-        animate_reliability(protocol, p_req_loss, p_reply_loss, retries=2, calls=calls, speed=speed)
-
-st.divider()
-st.caption("Note: These visuals intentionally mirror the slide style (two lifelines, horizontal arrows, labels). You can place this app side-by-side with the PDF for live teaching.")
+    if st.button("▶ Build animation", key="rp_btn"):
+        frames = make_frames_for_protocol(proto, calls, p_req_loss, p_rep_loss, retries=2, speed=speed2)
+        title = dict(R="R (request only)", RR="RR (req/reply + retries)", RRA="RRA (req/reply/ack)")[proto]
+        fig = base_fig(title)
+        fig.frames = frames
+        fig.update_layout(
+            updatemenus=[
+                dict(type="buttons",
+                     buttons=[
+                         dict(label="Play", method="animate", args=[None, {"frame": {"duration": 60, "redraw": True}, "fromcurrent": True}]),
+                         dict(label="Pause", method="animate", args=[[None], {"mode": "immediate", "frame": {"duration": 0, "redraw": False}}]),
+                     ],
+                     direction="left", x=0.5, y=-0.05, xanchor="center", yanchor="top")
+            ]
+        )
+        st.plotly_chart(fig, use_container_width=True, theme=None)
