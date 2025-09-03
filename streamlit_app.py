@@ -5,181 +5,285 @@ import time
 import math
 from collections import deque, defaultdict
 
-st.set_page_config(page_title="IPC Interactive Lecture", page_icon="🧩", layout="wide")
+import matplotlib.pyplot as plt
 
-st.title("🧩 Interactive IPC & RPC Lecture")
-st.caption("Hands-on activities covering sockets, marshalling, RPC, reliability, queues, SOAP vs REST, and more.")
+st.set_page_config(page_title="IPC Interactive Lecture (Animated)", page_icon="📡", layout="wide")
+
+st.title("📡 Interactive IPC & RPC Lecture — Animated")
+st.caption("Now with step-by-step animations for Message Passing and Reliability Protocols (R / RR / RRA).")
 
 # ---- Sidebar navigation ----
 section = st.sidebar.radio(
     "Go to",
     [
-        "1) Foundations & Stack",
-        "2) Sockets & Message Passing",
-        "3) Data Representation & Endianness",
-        "4) RPC Pipeline Simulator",
-        "5) Reliability Protocols: R / RR / RRA",
-        "6) Message Queue Simulator",
-        "7) SOAP vs REST vs GraphQL Chooser",
-        "8) API Gateway Sketchpad",
-        "9) Quick Quiz & Exit Ticket",
+        "A) Animated Message Passing",
+        "B) Animated Reliability Protocols",
+        "C) Endianness & Marshalling",
+        "D) RPC Pipeline (stepper)",
+        "E) Message Queue Simulator",
+        "F) API Style Chooser",
+        "G) Quick Quiz",
     ],
 )
 
-# ---- 1) Foundations & Stack ----
-if section == "1) Foundations & Stack":
-    st.header("1) Foundations & Stack Overview")
+# ---------- helpers ----------
+def draw_link(ax):
+    ax.plot([0.15, 0.85], [0.25, 0.25])
+    ax.plot([0.15, 0.85], [0.75, 0.75])
+    for x in [0.15, 0.85]:
+        ax.plot([x, x], [0.25, 0.75])
+    ax.text(0.1, 0.75, "Client", ha="right", va="center")
+    ax.text(0.9, 0.25, "Server", ha="left", va="center")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
 
-    st.subheader("Layer Mapping Activity")
-    st.write(
-        "Pick an example protocol or artifact for each layer. The goal is to see how application semantics ride on lower layers."
-    )
+def animate_packets(packets, duration_s, fps=20):
+    frames = int(duration_s * fps)
+    for f in range(frames + 1):
+        t = f / frames
+        yield t
 
-    with st.form("layer_form"):
-        app = st.selectbox(
-            "Application Layer (examples)",
-            ["HTTP", "FTP", "SOAP", "gRPC", "Custom App Protocol"],
-        )
-        pres = st.selectbox(
-            "Presentation Layer (data representation)",
-            ["JSON", "XML", "XDR", "ASN.1", "Java Serialization"],
-        )
-        trans = st.selectbox("Transport Layer", ["TCP (stream)", "UDP (datagram)"])
-        net = st.selectbox("Network Layer", ["IP", "IPv6", "Both"])
-        link = st.selectbox("Link Layer", ["Ethernet", "Wi‑Fi", "Others"])
-        submit = st.form_submit_button("Show Stack")
+def render_scene(msgs, replies, drops, dups, reorder_events):
+    st.write("**Legend**: request → •  reply → ○   (dropped messages will fade before arrival)")
+    fig, ax = plt.subplots()
+    draw_link(ax)
+    for m in msgs:
+        ax.annotate(f"{m['seq']}", (0.14, 0.76), xytext=(0.14, 0.76), fontsize=8)
+    for r in replies:
+        ax.annotate(f"{r['seq']}", (0.86, 0.24), xytext=(0.86, 0.24), fontsize=8)
+    ph = st.empty()
+    return fig, ax, ph
 
-    if submit:
-        st.success("Your stack:")
-        st.markdown(
-            "**Application** → {app}  \n"
-            "**Presentation** → {pres}  \n"
-            "**Transport** → {trans}  \n"
-            "**Network** → {net}  \n"
-            "**Link** → {link}"
-        .format(app=app, pres=pres, trans=trans, net=net, link=link))
-        st.info(
-            "Observation: IPC features (RPC, marshalling, request‑reply) sit above transport (TCP/UDP) but below applications."
-        )
+def move_dot(ax, x, y, filled=True, alpha=1.0):
+    if filled:
+        ax.plot([x], [y], marker="o", alpha=alpha)
+    else:
+        ax.plot([x], [y], marker="o", mfc="none", alpha=alpha)
 
-    st.divider()
-    st.subheader("Concept Nuggets")
-    st.markdown(
-        "- **IPC ≠ Transport**: IPC abstractions (RPC/RMI, events, message queues) rely on transport but add semantics.\n"
-        "- **Request‑Reply** underpins many patterns; marshalling ensures both ends agree on data layout."
-    )
+# ---------- A) Animated Message Passing ----------
+if section == "A) Animated Message Passing":
+    st.header("A) Animated Message Passing")
+    st.write("Visualize requests and replies moving across the network. Toggle loss, duplication, and reordering.")
 
-# ---- 2) Sockets & Message Passing ----
-elif section == "2) Sockets & Message Passing":
-    st.header("2) Sockets & Message Passing")
-
-    st.subheader("UDP Echo Playground (simulated)")
-    st.write(
-        "Simulate a UDP echo exchange with tunable **drop**, **duplication**, and **reordering** to see common pitfalls."
-    )
-    cols = st.columns(4)
+    cols = st.columns(5)
     with cols[0]:
-        n_msgs = st.number_input("Messages to send", min_value=1, max_value=200, value=20, step=1)
+        n_msgs = st.number_input("Messages", 1, 50, 6)
     with cols[1]:
-        p_drop = st.slider("Drop probability", 0.0, 1.0, 0.1, 0.01)
+        p_drop = st.slider("Drop probability", 0.0, 1.0, 0.2, 0.01)
     with cols[2]:
-        p_dup = st.slider("Duplicate probability", 0.0, 1.0, 0.05, 0.01)
+        p_dup = st.slider("Duplicate probability", 0.0, 1.0, 0.1, 0.01)
     with cols[3]:
-        p_reorder = st.slider("Reorder probability", 0.0, 1.0, 0.1, 0.01)
+        p_reorder = st.slider("Reorder probability", 0.0, 1.0, 0.2, 0.01)
+    with cols[4]:
+        speed = st.slider("Animation speed", 0.2, 2.0, 1.0, 0.1)
 
-    if st.button("Run Simulation"):
-        sent = list(range(1, n_msgs + 1))
-        in_flight = []
-        log = []
+    start = st.button("▶ Start animation")
 
-        for seq in sent:
-            if random.random() < p_drop:
-                log.append(f"Client → Server: **{seq}** DROPPED")
-                continue
-
-            # maybe duplicate
+    if start:
+        random.seed(42)
+        # Build outgoing messages with possible duplicates and drops
+        outgoing = []
+        for seq in range(1, n_msgs + 1):
             copies = 1 + (1 if random.random() < p_dup else 0)
-            for _ in range(copies):
-                # add jitter to simulate reordering
-                jitter = random.randint(0, int(100 * p_reorder))
-                in_flight.append((time.time() + jitter / 1000.0, seq))
+            for c in range(copies):
+                drop = random.random() < p_drop
+                jitter = random.random() * p_reorder
+                outgoing.append({
+                    "seq": seq,
+                    "t0": time.time() + jitter,
+                    "drop": drop,
+                    "duration": 2.0 / speed,
+                    "copy": c,
+                })
+        # Sort by t0 to simulate wire scheduling
+        outgoing.sort(key=lambda m: m["t0"])
 
-        # deliver
-        in_flight.sort(key=lambda x: x[0])
-        delivered_order = [seq for _, seq in in_flight]
+        # Prepare replies based on messages that arrive
+        replies_plan = []
 
-        # echo back
-        responses = delivered_order[:]
-        random.shuffle(responses)  # server sends independently; not guaranteed order
+        fig, ax, placeholder = render_scene(outgoing, replies_plan, p_drop, p_dup, p_reorder)
 
-        st.write("### Client Log")
-        for entry in log[:200]:
-            st.write("• " + entry)
-        if len(log) > 200:
-            st.caption(f"... and {len(log)-200} more")
+        # Animate requests one-by-one; if not dropped, schedule a reply
+        for m in outgoing:
+            fig, ax = plt.subplots()
+            draw_link(ax)
+            # Animate request
+            dur = m["duration"]
+            dropped = m["drop"]
+            for t in animate_packets([m], dur):
+                ax = plt.gca()
+                draw_link(ax)
+                x = 0.15 + 0.70 * t
+                y = 0.75
+                move_dot(ax, x, y, filled=True, alpha=1.0 if not dropped else (0.6 - 0.6 * t))
+                ax.text(0.5, 0.95, f"Request seq={m['seq']} ({'duplicate' if m['copy'] else 'original'})", ha="center")
+                ax.text(0.5, 0.05, f"{'DROPPED' if dropped else 'IN FLIGHT'}", ha="center")
+                placeholder.pyplot(fig)
+                plt.close(fig)
+                time.sleep(0.03)
+            # If arrived, send a reply back (random small delay)
+            if not dropped:
+                reply = {"seq": m["seq"], "duration": 2.0 / speed}
+                # 50% chance to reorder reply by inserting small delay
+                extra = 0.5 if random.random() < p_reorder else 0.0
+                # Animate reply
+                fig, ax = plt.subplots()
+                draw_link(ax)
+                for t in animate_packets([reply], reply["duration"] + extra):
+                    ax = plt.gca()
+                    draw_link(ax)
+                    x = 0.85 - 0.70 * min(1.0, t)
+                    y = 0.25
+                    move_dot(ax, x, y, filled=False, alpha=1.0)
+                    ax.text(0.5, 0.95, f"Reply for seq={reply['seq']}", ha="center")
+                    placeholder.pyplot(fig)
+                    plt.close(fig)
+                    time.sleep(0.03)
 
-        st.write("### Server Received (order)")
-        st.code(", ".join(map(str, delivered_order)) or "(none)")
+        st.success("Done. Observations: UDP-like behavior allows drops, dups, and reordering; applications add sequencing and retries.")
 
-        st.write("### Client Received Replies (order)")
-        st.code(", ".join(map(str, responses)) or "(none)")
+# ---------- B) Animated Reliability Protocols ----------
+elif section == "B) Animated Reliability Protocols":
+    st.header("B) Animated Reliability Protocols (R, RR, RRA)")
 
-        lost = [s for s in sent if s not in delivered_order]
-        dups = len(delivered_order) - len(set(delivered_order))
+    proto = st.radio("Protocol", ["R (request only)", "RR (request/reply + retries)", "RRA (request/reply/ack)"])
+    cols = st.columns(5)
+    with cols[0]:
+        calls = st.number_input("Calls", 1, 50, 6)
+    with cols[1]:
+        p_req_loss = st.slider("Req loss", 0.0, 1.0, 0.2, 0.01)
+    with cols[2]:
+        p_rep_loss = st.slider("Reply/ACK loss", 0.0, 1.0, 0.2, 0.01)
+    with cols[3]:
+        retries = st.slider("Max retries", 0, 8, 2)
+    with cols[4]:
+        speed = st.slider("Speed", 0.2, 2.0, 1.0, 0.1)
 
-        st.metric("Unique delivered", len(set(delivered_order)))
-        st.metric("Lost", len(lost))
-        st.metric("Duplicates (received by server)", dups)
+    go = st.button("▶ Simulate")
+    canvas = st.empty()
 
-        st.info(
-            "Takeaway: UDP is **unreliable & unordered**. Applications add reliability (e.g., sequence numbers, retransmissions)."
-        )
+    def frame_request(seq, label, tfrac, y, dropped=False, hollow=False):
+        fig, ax = plt.subplots()
+        draw_link(ax)
+        x = 0.15 + 0.70 * tfrac if y > 0.5 else 0.85 - 0.70 * tfrac
+        move_dot(ax, x, y, filled=not hollow, alpha=1.0 if not dropped else (0.6 - 0.6 * tfrac))
+        ax.text(0.5, 0.95, label, ha="center")
+        ax.text(0.5, 0.05, f"seq={seq}", ha="center")
+        canvas.pyplot(fig)
+        plt.close(fig)
 
-    st.divider()
-    st.subheader("Addressing Quick Check")
-    ip = st.text_input("Destination IP", "138.37.94.248")
-    port = st.number_input("Port", 0, 65535, 80)
-    st.write(f"**Socket address** → `{ip}:{port}`")
+    if go:
+        executed = 0
+        duplicates = 0
+        timeouts = 0
+        random.seed(7)
+        for seq in range(1, calls + 1):
+            attempts = 0
+            server_execs = 0
+            acked = False
+            got_reply = False
 
-# ---- 3) Data Representation & Endianness ----
-elif section == "3) Data Representation & Endianness":
-    st.header("3) Data Representation & Endianness")
+            if proto == "R (request only)":
+                attempts = 1
+                # animate request
+                for t in animate_packets([], 1.8 / speed):
+                    frame_request(seq, "Request (R)", t, 0.75, dropped=False)
+                    time.sleep(0.03)
+                lost = random.random() < p_req_loss
+                if lost:
+                    for t in animate_packets([], 0.6 / speed):
+                        frame_request(seq, "Request DROPPED", t, 0.75, dropped=True)
+                        time.sleep(0.03)
+                else:
+                    server_execs += 1
+                executed += 1 if server_execs > 0 else 0
+                if lost:
+                    timeouts += 1
 
-    st.subheader("Endianness Converter")
+            elif proto == "RR (request/reply + retries)":
+                while attempts <= retries and not got_reply:
+                    attempts += 1
+                    # animate request attempt
+                    for t in animate_packets([], 1.2 / speed):
+                        frame_request(seq, f"Request attempt {attempts} (RR)", t, 0.75)
+                        time.sleep(0.03)
+                    if random.random() >= p_req_loss:
+                        server_execs += 1
+                        # animate reply
+                        lost_reply = random.random() < p_rep_loss
+                        for t in animate_packets([], 1.2 / speed):
+                            frame_request(seq, "Reply", t, 0.25, dropped=lost_reply, hollow=True)
+                            time.sleep(0.03)
+                        if not lost_reply:
+                            got_reply = True
+                executed += 1 if server_execs > 0 else 0
+                duplicates += max(0, server_execs - 1)
+                if not got_reply:
+                    timeouts += 1
+
+            else:  # RRA
+                while attempts <= retries and not acked:
+                    attempts += 1
+                    # request
+                    for t in animate_packets([], 1.0 / speed):
+                        frame_request(seq, f"Request attempt {attempts} (RRA)", t, 0.75)
+                        time.sleep(0.03)
+                    if random.random() >= p_req_loss:
+                        server_execs += 1
+                        # reply
+                        lost_reply = random.random() < p_rep_loss
+                        for t in animate_packets([], 1.0 / speed):
+                            frame_request(seq, "Reply", t, 0.25, dropped=lost_reply, hollow=True)
+                            time.sleep(0.03)
+                        if not lost_reply:
+                            # ack
+                            lost_ack = random.random() < p_rep_loss
+                            for t in animate_packets([], 1.0 / speed):
+                                frame_request(seq, "ACK", t, 0.75, dropped=lost_ack, hollow=False)
+                                time.sleep(0.03)
+                            if not lost_ack:
+                                acked = True
+                executed += 1 if server_execs > 0 else 0
+                duplicates += max(0, server_execs - 1)
+                if not acked:
+                    timeouts += 1
+
+        st.success("Simulation complete.")
+        st.metric("Calls that executed at least once", executed)
+        st.metric("Duplicate executions (risk!)", duplicates)
+        st.metric("Client timeouts (no reply/ack)", timeouts)
+        if proto.startswith("RR"):
+            st.info("RR gives **at-least-once** unless you deduplicate. RRA reduces ambiguity using explicit ACKs.")
+
+# ---------- C) Endianness & Marshalling ----------
+elif section == "C) Endianness & Marshalling":
+    st.header("C) Endianness & Marshalling")
     hex_in = st.text_input("Hex value (no 0x)", "07BA")
     byte_count = st.number_input("Bytes", min_value=1, max_value=8, value=2)
     if st.button("Convert"):
         try:
             val = int(hex_in, 16)
-            be = val.to_bytes(byte_count, byteorder="big", signed=False)
-            le = val.to_bytes(byte_count, byteorder="little", signed=False)
-            st.write(f"**Big‑endian bytes**: {be.hex(' ')}")
-            st.write(f"**Little‑endian bytes**: {le.hex(' ')}")
-            st.caption("Network byte order is big‑endian.")
+            be = val.to_bytes(byte_count, byteorder="big", signed=False).hex(" ")
+            le = val.to_bytes(byte_count, byteorder="little", signed=False).hex(" ")
+            st.write(f"**Big-endian**: {be}")
+            st.write(f**"Little-endian**: {le}")
+            st.caption("Network byte order is big-endian.")
         except Exception as e:
-            st.error(f"Invalid hex or byte size: {e}")
-
-    st.divider()
-    st.subheader("Marshalling Thought Experiment")
-    st.markdown(
-        "Pick a representation for the object `{year: 1978, name: 'Lars'}` and discuss trade‑offs."
-    )
-    rep = st.radio("Choose", ["JSON", "XML", "XDR/ASN.1", "Protocol Buffers", "Java Serialization"])
+            st.error(f"Invalid hex/bytes: {e}")
+    rep = st.radio("Representation for {year:1978, name:'Lars'}", ["JSON", "XML", "XDR/ASN.1", "Protocol Buffers", "Java Serialization"])
     pros = {
-        "JSON": "Human‑readable, ubiquitous, weak typing.",
+        "JSON": "Human-readable, ubiquitous, weak typing.",
         "XML": "Verbose, schemas (XSD), good for documents.",
-        "XDR/ASN.1": "Strongly specified, cross‑lang binary.",
-        "Protocol Buffers": "Compact, schema‑evolved binary.",
+        "XDR/ASN.1": "Strongly specified, cross-lang binary.",
+        "Protocol Buffers": "Compact, schema-evolved binary.",
         "Java Serialization": "Tight with JVM, versioning issues.",
     }
     st.info(pros[rep])
 
-# ---- 4) RPC Pipeline Simulator ----
-elif section == "4) RPC Pipeline Simulator":
-    st.header("4) RPC Pipeline Simulator")
-
-    st.write("Step through the phases of a remote call.")
-
+# ---------- D) RPC Pipeline (stepper) ----------
+elif section == "D) RPC Pipeline (stepper)":
+    st.header("D) RPC Pipeline (stepper)")
     phase = st.select_slider(
         "Phase",
         options=[
@@ -195,7 +299,6 @@ elif section == "4) RPC Pipeline Simulator":
         ],
         value="Client: call()",
     )
-
     explanations = {
         "Client: call()": "App code invokes a method as if local.",
         "Client stub: marshal": "Parameters packed into external form (type, byte order).",
@@ -209,101 +312,9 @@ elif section == "4) RPC Pipeline Simulator":
     }
     st.success(explanations[phase])
 
-    st.subheader("Failure Injection")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        drop_req = st.checkbox("Drop request")
-    with c2:
-        drop_reply = st.checkbox("Drop reply")
-    with c3:
-        type_mismatch = st.checkbox("Type mismatch")
-
-    st.write("**What happens?**")
-    if drop_req:
-        st.warning("Client will timeout waiting for reply (unless retries).")
-    if drop_reply:
-        st.warning("Server executed, but client may retry → duplicates unless idempotent.")
-    if type_mismatch:
-        st.error("Unmarshalling fails: version skew or schema mismatch.")
-
-# ---- 5) Reliability Protocols ----
-elif section == "5) Reliability Protocols: R / RR / RRA":
-    st.header("5) Reliability Protocols Simulator")
-
-    st.write(
-        "Compare request patterns under loss. Toggle probabilities and see delivery semantics."
-    )
-    col = st.columns(4)
-    with col[0]:
-        trials = st.number_input("Calls", 1, 200, 50)
-    with col[1]:
-        p_loss = st.slider("Loss probability", 0.0, 1.0, 0.2, 0.01)
-    with col[2]:
-        p_reply_loss = st.slider("Reply loss probability", 0.0, 1.0, 0.2, 0.01)
-    with col[3]:
-        max_retries = st.slider("Max retries (RR/RRA)", 0, 10, 3)
-
-    proto = st.radio("Protocol", ["R (request only)", "RR (request/reply)", "RRA (request/reply/ack)"])
-
-    if st.button("Simulate"):
-        executed = 0
-        duplicates = 0
-        timeouts = 0
-        for i in range(trials):
-            if proto == "R (request only)":
-                # One-shot, no retry
-                if random.random() >= p_loss:
-                    executed += 1  # server executes
-                else:
-                    timeouts += 1
-            elif proto == "RR (request/reply)":
-                # Retries until reply or max_retries
-                sent = 0
-                got_reply = False
-                server_execs = 0
-                while sent <= max_retries and not got_reply:
-                    sent += 1
-                    if random.random() >= p_loss:
-                        server_execs += 1  # request arrived; server executed
-                        if random.random() >= p_reply_loss:
-                            got_reply = True
-                executed += 1 if server_execs > 0 else 0
-                duplicates += max(0, server_execs - 1)
-                if not got_reply:
-                    timeouts += 1
-            else:  # RRA
-                sent = 0
-                got_reply = False
-                server_execs = 0
-                acked = False
-                while sent <= max_retries and not acked:
-                    sent += 1
-                    if random.random() >= p_loss:
-                        server_execs += 1
-                        # reply may be lost
-                        if random.random() >= p_reply_loss:
-                            got_reply = True
-                            # ack may also be lost? model via reply_loss again
-                            if random.random() >= p_reply_loss:
-                                acked = True
-                executed += 1 if server_execs > 0 else 0
-                duplicates += max(0, server_execs - 1)
-                if not acked:
-                    timeouts += 1
-
-        st.metric("Calls that executed at least once", executed)
-        st.metric("Duplicate executions (risk!)", duplicates)
-        st.metric("Client timeouts (no reply/ack)", timeouts)
-
-        if proto.startswith("RR"):
-            st.info("RR provides **at‑least‑once** semantics unless you deduplicate. RRA approximates **exactly‑once** at the cost of extra messages/state.")
-
-# ---- 6) Message Queue Simulator ----
-elif section == "6) Message Queue Simulator":
-    st.header("6) Message Queue Simulator")
-
-    st.write("Model a simple 1‑producer / 1‑consumer queue and watch backlog growth or drain.")
-
+# ---------- E) Message Queue Simulator ----------
+elif section == "E) Message Queue Simulator":
+    st.header("E) Message Queue Simulator")
     a, b, c = st.columns(3)
     with a:
         prod_rate = st.slider("Producer msgs/sec", 0.0, 200.0, 50.0, 1.0)
@@ -311,27 +322,23 @@ elif section == "6) Message Queue Simulator":
         cons_rate = st.slider("Consumer msgs/sec", 0.0, 200.0, 40.0, 1.0)
     with c:
         duration = st.slider("Duration (sec)", 1, 120, 30)
-
     if st.button("Run Queue Sim"):
         backlog = 0.0
-        backlog_points = []
+        ys = []
         for t in range(duration + 1):
             backlog = max(0.0, backlog + prod_rate - cons_rate)
-            backlog_points.append({"t": t, "backlog": backlog})
-        st.line_chart({ "backlog": [p["backlog"] for p in backlog_points] })
+            ys.append(backlog)
+        st.line_chart({"backlog": ys})
         if prod_rate > cons_rate:
-            st.warning("Backlog grows → need scaling / batching / DLQ.")
+            st.warning("Backlog grows → scale consumers / batch / DLQ.")
         elif prod_rate < cons_rate:
             st.success("Backlog drains; capacity is sufficient.")
         else:
             st.info("Backlog stable; system at equilibrium.")
 
-# ---- 7) SOAP vs REST vs GraphQL Chooser ----
-elif section == "7) SOAP vs REST vs GraphQL Chooser":
-    st.header("7) SOAP vs REST vs GraphQL Chooser")
-
-    st.write("Pick constraints; get a recommendation.")
-
+# ---------- F) API Style Chooser ----------
+elif section == "F) API Style Chooser":
+    st.header("F) API Style Chooser (SOAP / REST / GraphQL / gRPC)")
     needs = st.multiselect(
         "Constraints / needs",
         [
@@ -346,7 +353,6 @@ elif section == "7) SOAP vs REST vs GraphQL Chooser":
             "Mobile-friendly payload shaping",
         ],
     )
-
     rec = []
     if "Strong contract & WS-Security" in needs or "Legacy B2B integration" in needs:
         rec.append("SOAP")
@@ -355,38 +361,15 @@ elif section == "7) SOAP vs REST vs GraphQL Chooser":
     if "Single endpoint / flexible queries" in needs or "Mobile-friendly payload shaping" in needs:
         rec.append("GraphQL")
     if "Binary efficiency" in needs or "Streaming updates" in needs:
-        rec.append("gRPC (RPC over HTTP/2)")
-
+        rec.append("gRPC")
     if rec:
         st.success("Recommended fit(s): " + ", ".join(sorted(set(rec))))
     else:
         st.info("Select some constraints to see a recommendation.")
 
-# ---- 8) API Gateway Sketchpad ----
-elif section == "8) API Gateway Sketchpad":
-    st.header("8) API Gateway Sketchpad")
-
-    st.write("Plan cross‑cutting concerns for clients and services.")
-
-    # Simple tag inputs using text and split
-    clients_raw = st.text_input("Client types (comma-separated)", "web, mobile")
-    services_raw = st.text_input("Backend services (comma-separated)", "catalog, orders, accounts")
-
-    clients = [c.strip() for c in clients_raw.split(",") if c.strip()]
-    services = [s.strip() for s in services_raw.split(",") if s.strip()]
-
-    checks = st.multiselect(
-        "Policies at the gateway",
-        ["AuthN/AuthZ", "Rate limiting", "Request shaping", "Protocol translation", "Caching", "Observability"],
-        default=["AuthN/AuthZ", "Rate limiting", "Observability"],
-    )
-    st.write("**Summary**")
-    st.json({"clients": clients, "services": services, "gateway_policies": checks})
-
-# ---- 9) Quick Quiz & Exit Ticket ----
-elif section == "9) Quick Quiz & Exit Ticket":
-    st.header("9) Quick Quiz & Exit Ticket")
-
+# ---------- G) Quick Quiz ----------
+elif section == "G) Quick Quiz":
+    st.header("G) Quick Quiz")
     def q(question, options, answer_idx, key):
         st.write("**" + question + "**")
         choice = st.radio("", options, key=key, horizontal=True)
@@ -395,17 +378,10 @@ elif section == "9) Quick Quiz & Exit Ticket":
                 st.success("✅ Correct")
             else:
                 st.error(f"❌ Not quite. Correct: {options[answer_idx]}")
-
-    q("Which layer provides marshalling & request‑reply semantics?",
+    q("Which layer provides marshalling & request-reply semantics?",
       ["Application", "Middleware", "Transport", "Network"],
       1, "q1")
-
-    q("UDP gives you:", ["Reliable, in-order delivery", "Unreliable, unordered datagrams", "Message queues", "Exactly‑once semantics"], 1, "q2")
-
-    q("RR + timeouts without dedup gives:", ["At‑most‑once", "At‑least‑once", "Exactly‑once"], 1, "q3")
-
-    st.subheader("Exit Ticket")
-    takeaway = st.text_area("One concept you understand well + one you want to revisit")
-    if st.button("Save Exit Ticket"):
-        # In a real deployment you'd persist this; here we keep it ephemeral.
-        st.success("Saved locally (session state). Thanks!")
+    q("RR + timeouts without dedup gives:",
+      ["At-most-once", "At-least-once", "Exactly-once"], 1, "q2")
+    q("Network byte order is:",
+      ["Little-endian", "Big-endian"], 1, "q3")
