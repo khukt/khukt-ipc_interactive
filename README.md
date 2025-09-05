@@ -1,27 +1,22 @@
-# IPC Interactive Lecture (Streamlit)
 
-This repo contains a single Streamlit app with interactive activities for an IPC/RPC lecture.
+# Trustworthy AI Demos — 6G / IIoT (Streamlit)
+
+Three lightweight, self-contained demos tailored to networking & industrial IoT:
+1) **Resource Allocation (TreeSHAP)** — local feature attributions for a Random Forest.
+2) **Network Anomaly Detection (LIME)** — local surrogate explanations for a gradient boosting classifier.
+3) **Predictive Maintenance (Counterfactuals)** — what-if sliders + simple greedy counterfactual search for logistic regression.
 
 ## Run locally
-
 ```bash
 pip install -r requirements.txt
-streamlit run streamlit_app.py
+streamlit run app.py
 ```
 
 ## Deploy on Streamlit Community Cloud
-
-1. Create a new GitHub repo.
-2. Add these files:
-   - `streamlit_app.py`
-   - `requirements.txt`
-3. On https://share.streamlit.io, create a new app and point to `streamlit_app.py` as the **Main file path**.
-4. If the app hangs at *Provisioning*, try:
-   - Make sure `requirements.txt` exists (pin `streamlit>=1.30`).
-   - Ensure the main file is named `streamlit_app.py` or set correctly in app settings.
-   - Clear/reboot the app (in the app's **Settings → Manage app → Restart**).
-   - If Python version mismatch occurs, add a `runtime.txt` with `3.11`.
+1. Push these files (`app.py`, `requirements.txt`) to a public GitHub repo.
+2. Go to https://share.streamlit.io → **New app** → pick your repo/branch → **Deploy**.
+3. Done. The app auto-installs requirements and runs.
 
 ## Notes
-- The app uses only the standard library plus Streamlit; no network access or secrets required.
-- If you previously used `st.tags_input`, this file already uses simple text inputs for maximum compatibility.
+- All datasets are synthetic and generated at runtime — no external data needed.
+- If SHAP or LIME fail to install on the free tier, the app gracefully falls back to permutation importance / sensitivity analysis.

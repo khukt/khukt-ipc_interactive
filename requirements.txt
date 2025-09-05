@@ -1,4 +1,7 @@
-streamlit>=1.30,<2.0
-plotly>=5.20
-matplotlib
+streamlit
+scikit-learn
 pandas
+numpy
+matplotlib
+shap
+lime
