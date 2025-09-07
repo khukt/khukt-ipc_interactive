@@ -1,255 +1,276 @@
-
 import streamlit as st
-import random
-import plotly.graph_objects as go
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="IPC Lecture — Plotly Animations (R/RR/RRA)", page_icon="🎞️", layout="wide")
-st.title("🎞️ IPC & RPC — Plotly Animations")
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import roc_auc_score, accuracy_score
 
-X_CLIENT = 0.2
-X_SERVER = 0.8
+# Optional imports that might fail on some environments; guard gracefully
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except Exception:
+    SHAP_AVAILABLE = False
 
-def base_fig(title=""):
-    fig = go.Figure()
-    # Lifelines
-    fig.add_shape(type="line", x0=X_CLIENT, y0=0.9, x1=X_CLIENT, y1=0.1,
-                  line=dict(color="black", width=2, dash="dash"))
-    fig.add_shape(type="line", x0=X_SERVER, y0=0.9, x1=X_SERVER, y1=0.1,
-                  line=dict(color="black", width=2, dash="dash"))
-    # Headers
-    fig.add_shape(type="rect", x0=X_CLIENT-0.1, y0=0.92, x1=X_CLIENT+0.1, y1=0.97, line=dict(color="black"), fillcolor="white")
-    fig.add_shape(type="rect", x0=X_SERVER-0.1, y0=0.92, x1=X_SERVER+0.1, y1=0.97, line=dict(color="black"), fillcolor="white")
-    fig.add_annotation(x=X_CLIENT, y=0.945, text="Client", showarrow=False)
-    fig.add_annotation(x=X_SERVER, y=0.945, text="Server", showarrow=False)
-    # Axes/size
-    fig.update_xaxes(visible=False, range=[0,1])
-    fig.update_yaxes(visible=False, range=[0,1])
-    fig.update_layout(margin=dict(l=10,r=10,t=30,b=10), height=460, title=title, transition={"duration":0})
-    return fig
+try:
+    from lime.lime_tabular import LimeTabularExplainer
+    LIME_AVAILABLE = True
+except Exception:
+    LIME_AVAILABLE = False
 
-def msg_frames(n_msgs=6, p_drop=0.2, p_dup=0.1, p_reorder=0.2, speed=1.0, seed=42):
-    rnd = random.Random(seed)
-    lane_gap = 0.11
-    y = 0.83
-    plan = []
-    for seq in range(1, n_msgs+1):
-        copies = 1 + (1 if rnd.random() < p_dup else 0)
-        for c in range(copies):
-            drop = rnd.random() < p_drop
-            jitter = rnd.random() * p_reorder
-            plan.append({"seq": seq, "copy": c, "drop": drop, "jitter": jitter, "y": y})
-        y -= lane_gap
-    plan.sort(key=lambda m: m["jitter"])
+st.set_page_config(page_title="Trustworthy AI Demos (6G/IIoT)", layout="wide")
 
-    frames = []
-    legend_req = go.Scatter(x=[None], y=[None], mode="markers", name="Request", marker=dict(symbol="triangle-right", size=14, color="black"))
-    legend_rep = go.Scatter(x=[None], y=[None], mode="markers", name="Reply", marker=dict(symbol="triangle-left", size=14, color="black"))
-    legend_drop = go.Scatter(x=[None], y=[None], mode="markers", name="Drop ✕", marker=dict(symbol="x-thin", size=14, color="crimson"))
-    moving = go.Scatter(x=[X_CLIENT], y=[0.83], mode="markers",
-                        marker=dict(symbol="triangle-right", size=16, color="black"))
-    frames.append(go.Frame(name="start", data=[legend_req, legend_rep, legend_drop, moving]))
+st.title("Trustworthy AI Demos — 6G / IIoT")
+st.caption("Three lightweight, self-contained demos for Explainable AI, tailored to networking & industrial IoT.")
 
-    tname = 0
-    for item in plan:
-        steps = int(20 * speed)
-        for k in range(steps+1):
-            t = k/steps
-            x = X_CLIENT + (X_SERVER - X_CLIENT) * t
-            y = item["y"]
-            opac = 0.35 + 0.65*(1.0 - t) if item["drop"] else 1.0
-            m = go.Scatter(x=[x], y=[y], mode="markers",
-                           marker=dict(symbol="triangle-right", size=16, color="black", opacity=opac), showlegend=False)
-            frames.append(go.Frame(name=f"f{tname}", data=[legend_req, legend_rep, legend_drop, m]))
-            tname += 1
-        if item["drop"]:
-            d = go.Scatter(x=[X_SERVER-0.02], y=[item["y"]], mode="markers",
-                           marker=dict(symbol="x-thin", size=18, color="crimson"), showlegend=False)
-            frames.append(go.Frame(name=f"drop{tname}", data=[legend_req, legend_rep, legend_drop, d]))
-            tname += 1
-        else:
-            steps = int(20 * speed)
-            for k in range(steps+1):
-                t = k/steps
-                x = X_SERVER - (X_SERVER - X_CLIENT) * t
-                y = item["y"] - 0.05
-                m = go.Scatter(x=[x], y=[y], mode="markers",
-                               marker=dict(symbol="triangle-left", size=16, color="black"), showlegend=False)
-                frames.append(go.Frame(name=f"f{tname}", data=[legend_req, legend_rep, legend_drop, m]))
-                tname += 1
-    return [legend_req, legend_rep, legend_drop, moving], frames
+demo = st.sidebar.radio(
+    "Choose a demo",
+    ["1) Resource Allocation (TreeSHAP)",
+     "2) Network Anomaly Detection (LIME)",
+     "3) Predictive Maintenance (Counterfactuals)"]
+)
 
-# ---------------- Reliability Animation ----------------
+# --------- Utility: synthetic data generators --------- #
+rng = np.random.default_rng(42)
 
-def reliability_frames(proto="RR", calls=4, p_req_loss=0.25, p_rep_loss=0.25, retries=2, speed=1.0, seed=7):
-    rnd = random.Random(seed)
-    frames = []
-    # legends + moving marker
-    legend_req = go.Scatter(x=[None], y=[None], mode="markers", name="Request", marker=dict(symbol="triangle-right", size=14, color="black"))
-    legend_rep = go.Scatter(x=[None], y=[None], mode="markers", name="Reply", marker=dict(symbol="triangle-left", size=14, color="black"))
-    legend_ack = go.Scatter(x=[None], y=[None], mode="markers", name="ACK", marker=dict(symbol="triangle-right", size=14, color="green"))
-    legend_drop = go.Scatter(x=[None], y=[None], mode="markers", name="Drop ✕", marker=dict(symbol="x-thin", size=14, color="crimson"))
-    moving = go.Scatter(x=[X_CLIENT], y=[0.83], mode="markers",
-                        marker=dict(symbol="triangle-right", size=16, color="black"))
-    frames.append(go.Frame(name="start", data=[legend_req, legend_rep, legend_ack, legend_drop, moving]))
+def gen_resource_alloc(n=800, seed=0):
+    r = np.random.default_rng(seed)
+    snr = r.normal(loc=10, scale=5, size=n)          # dB
+    latency_req = r.uniform(1, 100, size=n)          # ms
+    energy = r.uniform(0.1, 1.0, size=n)             # normalized
+    mobility = r.uniform(0, 50, size=n)              # km/h
+    device_priority = r.integers(0, 3, size=n)       # {0,1,2}
+    # Label rule: allocate if (SNR high) & (latency strict) & (priority high) OR (energy high & low mobility)
+    score = 0.35*(snr>12) + 0.25*(latency_req<20) + 0.25*(device_priority==2) + 0.15*((energy>0.6)&(mobility<10))
+    y = (score + r.normal(0, 0.05, n) > 0.5).astype(int)
+    X = pd.DataFrame({
+        "snr_db": snr,
+        "latency_req_ms": latency_req,
+        "energy_norm": energy,
+        "mobility_kmh": mobility,
+        "device_priority": device_priority
+    })
+    return X, y
 
-    y = 0.83
-    step = 0.16
-    tname = 0
+def gen_anomaly(n=1000, seed=1):
+    r = np.random.default_rng(seed)
+    mean_latency = r.normal(30, 10, size=n)          # ms
+    jitter = r.exponential(5, size=n)                # ms
+    throughput = r.normal(100, 30, size=n)           # Mbps
+    pkt_drop = r.uniform(0, 5, size=n)               # %
+    burstiness = r.uniform(0, 1, size=n)             # unitless
 
-    def move(symbol, ltr=True, yy=0.83, color="black"):
-        nonlocal tname
-        steps = int(18 * speed)
-        for k in range(steps+1):
-            t = k/steps
-            x = X_CLIENT + (X_SERVER - X_CLIENT) * t if ltr else X_SERVER - (X_SERVER - X_CLIENT) * t
-            m = go.Scatter(x=[x], y=[yy], mode="markers",
-                           marker=dict(symbol=symbol, size=16, color=color), showlegend=False)
-            frames.append(go.Frame(name=f"pf{tname}", data=[legend_req, legend_rep, legend_ack, legend_drop, m]))
-            tname += 1
+    # Attack rule: high jitter or high drop + bursts; or weird combo low throughput + high latency
+    score = 0.4*(jitter>10) + 0.3*(pkt_drop>2.5) + 0.2*(burstiness>0.7) + 0.2*((throughput<70)&(mean_latency>45))
+    y = (score + r.normal(0, 0.05, n) > 0.5).astype(int)
+    X = pd.DataFrame({
+        "mean_latency_ms": mean_latency,
+        "jitter_ms": jitter,
+        "throughput_mbps": throughput,
+        "packet_drop_pct": pkt_drop,
+        "burstiness": burstiness
+    })
+    return X, y
 
-    def cross(yy):
-        nonlocal tname
-        d = go.Scatter(x=[X_SERVER-0.02], y=[yy], mode="markers",
-                       marker=dict(symbol="x-thin", size=18, color="crimson"), showlegend=False)
-        frames.append(go.Frame(name=f"px{tname}", data=[legend_req, legend_rep, legend_ack, legend_drop, d]))
-        tname += 1
+def gen_maintenance(n=900, seed=2):
+    r = np.random.default_rng(seed)
+    temp = r.normal(65, 15, size=n)                  # °C
+    vibration = r.normal(25, 8, size=n)              # Hz
+    pressure = r.normal(4, 1.2, size=n)              # bar
+    age = r.uniform(0, 10, size=n)                   # years
 
-    for call in range(1, calls+1):
-        attempts = 0
-        got_reply = False
-        acked = False
-        server_execs = 0
-        title = f"{proto} — Call #{call}"
-        frames.append(go.Frame(name=f"title{tname}", data=[legend_req, legend_rep, legend_ack, legend_drop, moving],
-                               layout=go.Layout(title=title)))
-        tname += 1
+    # Failure rule: high temp, high vibration, high age; pressure extremes
+    score = 0.35*(temp>75) + 0.3*(vibration>30) + 0.2*(age>6) + 0.15*((pressure<3)|(pressure>6))
+    y = (score + r.normal(0, 0.05, n) > 0.5).astype(int)
+    X = pd.DataFrame({
+        "temp_c": temp,
+        "vibration_hz": vibration,
+        "pressure_bar": pressure,
+        "age_years": age
+    })
+    return X, y
 
-        if proto == "R":
-            attempts = 1
-            lost_req = rnd.random() < p_req_loss
-            move("triangle-right", True, y, "black")
-            if lost_req:
-                cross(y)
-            else:
-                server_execs += 1
-            note = f"Server executions: {server_execs}"
-            frames.append(go.Frame(name=f"sum{tname}", data=[legend_req, legend_rep, legend_ack, legend_drop, moving],
-                                   layout=go.Layout(title=title + "  •  " + note)))
-            tname += 1
-            y -= step
+# --------- Demo 1: Resource Allocation with TreeSHAP --------- #
+if demo.startswith("1"):
+    st.header("1) Resource Allocation (TreeSHAP)")
+    st.write("**Question**: Why did the RL-inspired policy allocate bandwidth to Device A instead of B? "
+             "We train a simple Random Forest on synthetic network features and explain its decision with TreeSHAP.")
+    X, y = gen_resource_alloc()
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0, stratify=y)
 
-        elif proto == "RR":
-            while attempts <= retries and not got_reply:
-                attempts += 1
-                lost_req = rnd.random() < p_req_loss
-                move("triangle-right", True, y, "black")
-                if not lost_req:
-                    server_execs += 1
-                    lost_rep = rnd.random() < p_rep_loss
-                    move("triangle-left", False, y-0.05, "black")
-                    if not lost_rep:
-                        got_reply = True
-                else:
-                    cross(y)
-                note = f"try {attempts} • server execs: {server_execs}" + (" • reply received" if got_reply else "")
-                frames.append(go.Frame(name=f"sum{tname}", data=[legend_req, legend_rep, legend_ack, legend_drop, moving],
-                                       layout=go.Layout(title=title + "  •  " + note)))
-                tname += 1
-                y -= step
+    clf = RandomForestClassifier(n_estimators=200, random_state=0, max_depth=6)
+    clf.fit(X_train, y_train)
+    preds = clf.predict_proba(X_test)[:,1]
+    st.write(f"**Accuracy**: {accuracy_score(y_test, (preds>0.5).astype(int)):.3f} • **ROC-AUC**: {roc_auc_score(y_test, preds):.3f}")
 
-        else:  # RRA
-            while attempts <= retries and not acked:
-                attempts += 1
-                lost_req = rnd.random() < p_req_loss
-                move("triangle-right", True, y, "black")
-                if not lost_req:
-                    server_execs += 1
-                    lost_rep = rnd.random() < p_rep_loss
-                    move("triangle-left", False, y-0.05, "black")
-                    if not lost_rep:
-                        lost_ack = rnd.random() < p_rep_loss
-                        move("triangle-right", True, y-0.10, "green")
-                        if not lost_ack:
-                            acked = True
-                else:
-                    cross(y)
-                note = f"try {attempts} • server execs: {server_execs}" + (" • ack received" if acked else "")
-                frames.append(go.Frame(name=f"sum{tname}", data=[legend_req, legend_rep, legend_ack, legend_drop, moving],
-                                       layout=go.Layout(title=title + "  •  " + note)))
-                tname += 1
-                y -= step
+    idx = st.slider("Choose a test sample to explain", min_value=0, max_value=len(X_test)-1, value=5, step=1)
+    x_instance = X_test.iloc[[idx]]
 
-    return [legend_req, legend_rep, legend_ack, legend_drop, moving], frames
+    if SHAP_AVAILABLE:
+        explainer = shap.TreeExplainer(clf)
+        shap_values = explainer.shap_values(x_instance)
+        st.subheader("Feature Contributions (SHAP)")
+        fig, ax = plt.subplots()
+        # For binary classifier, shap_values is a list [class0, class1]; pick class 1
+        vals = shap_values[1][0]
+        order = np.argsort(np.abs(vals))[::-1]
+        labels = x_instance.columns[order]
+        vals_sorted = vals[order]
+        ax.barh(labels, vals_sorted)
+        ax.invert_yaxis()
+        ax.set_xlabel("SHAP value → contribution to P(allocate_to_A)")
+        st.pyplot(fig)
+    else:
+        st.warning("SHAP not available in this environment; showing permutation importance instead.")
+        # Simple permutation importance as a fallback
+        base = clf.score(X_test, y_test)
+        imps = []
+        for col in X_test.columns:
+            Xp = X_test.copy()
+            Xp[col] = np.random.permutation(Xp[col].values)
+            imps.append(base - clf.score(Xp, y_test))
+        imp_series = pd.Series(imps, index=X_test.columns).sort_values(ascending=False)
+        st.bar_chart(imp_series)
 
-# ---------------- UI ----------------
+    st.markdown("**Takeaway**: TreeSHAP gives a local explanation per decision, showing which features pushed the model toward allocating bandwidth.")
 
-tab1, tab2 = st.tabs(["A) Message Passing", "B) Reliability (R/RR/RRA)"])
+# --------- Demo 2: Network Anomaly Detection with LIME --------- #
+elif demo.startswith("2"):
+    st.header("2) Network Anomaly Detection (LIME)")
+    st.write("**Question**: Why did the detector flag this traffic as an attack? "
+             "We train a Gradient Boosting classifier and use LIME to explain a single prediction.")
+    X, y = gen_anomaly()
+    X_train, X_test, y_train, y_test = train_test_split(X.values, y, test_size=0.25, random_state=0, stratify=y)
 
-with tab1:
-    st.subheader("A) Message Passing — drops, duplicates, reorder (slides 32–34)")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        n_msgs = st.number_input("Messages", 1, 20, 6, key="n")
-    with c2:
-        p_drop = st.slider("Loss", 0.0, 1.0, 0.2, 0.01, key="loss")
-    with c3:
-        p_dup = st.slider("Duplicate", 0.0, 1.0, 0.1, 0.01, key="dup")
-    with c4:
-        p_reorder = st.slider("Reorder", 0.0, 1.0, 0.2, 0.01, key="reo")
-    with c5:
-        speed = st.slider("Speed", 0.5, 3.0, 1.0, 0.1, key="spd")
+    model = GradientBoostingClassifier(random_state=0)
+    model.fit(X_train, y_train)
+    preds = model.predict_proba(X_test)[:,1]
+    st.write(f"**Accuracy**: {accuracy_score(y_test, (preds>0.5).astype(int)):.3f} • **ROC-AUC**: {roc_auc_score(y_test, preds):.3f}")
 
-    if st.button("▶ Build animation", key="build_msg"):
-        data, frames = msg_frames(n_msgs, p_drop, p_dup, p_reorder, speed)
-        fig = base_fig("Message Passing")
-        fig.add_traces(data)
-        fig.frames = frames
-        fig.update_layout(
-            updatemenus=[dict(type="buttons",
-                              buttons=[
-                                  dict(label="Play", method="animate",
-                                       args=[None, {"frame": {"duration": 70, "redraw": True},
-                                                    "fromcurrent": True, "transition": {"duration": 0}}]),
-                                  dict(label="Pause", method="animate",
-                                       args=[[None], {"mode": "immediate",
-                                                      "frame": {"duration": 0, "redraw": False},
-                                                      "transition": {"duration": 0}}]),
-                              ],
-                              direction="left", x=0.5, y=-0.05, xanchor="center", yanchor="top")]
+    idx = st.slider("Choose a test sample to explain", min_value=0, max_value=len(X_test)-1, value=10, step=1)
+    x_instance = X_test[idx]
+
+    if LIME_AVAILABLE:
+        explainer = LimeTabularExplainer(
+            training_data=X_train,
+            feature_names=list(pd.DataFrame(X).columns),
+            class_names=["normal","attack"],
+            discretize_continuous=True,
+            mode="classification"
         )
-        st.plotly_chart(fig, use_container_width=True, theme=None)
-
-with tab2:
-    st.subheader("B) Reliability Protocols — R / RR / RRA (slides 36–38)")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        proto = st.selectbox("Protocol", ["R", "RR", "RRA"], key="rp_proto")
-    with c2:
-        calls = st.number_input("Calls", 1, 15, 4, key="rp_calls")
-    with c3:
-        p_req_loss = st.slider("Req loss", 0.0, 1.0, 0.25, 0.01, key="rp_rloss")
-    with c4:
-        p_rep_loss = st.slider("Reply/ACK loss", 0.0, 1.0, 0.25, 0.01, key="rp_reploss")
-    with c5:
-        speed2 = st.slider("Speed", 0.5, 3.0, 1.0, 0.1, key="rp_spd")
-
-    if st.button("▶ Build animation", key="build_rel"):
-        data, frames = reliability_frames(proto, calls, p_req_loss, p_rep_loss, retries=2, speed=speed2)
-        title = dict(R="R (request only)", RR="RR (req/reply + retries)", RRA="RRA (req/reply/ack)")[proto]
-        fig = base_fig(title)
-        fig.add_traces(data)
-        fig.frames = frames
-        fig.update_layout(
-            updatemenus=[dict(type="buttons",
-                              buttons=[
-                                  dict(label="Play", method="animate",
-                                       args=[None, {"frame": {"duration": 70, "redraw": True},
-                                                    "fromcurrent": True, "transition": {"duration": 0}}]),
-                                  dict(label="Pause", method="animate",
-                                       args=[[None], {"mode": "immediate",
-                                                      "frame": {"duration": 0, "redraw": False},
-                                                      "transition": {"duration": 0}}]),
-                              ],
-                              direction="left", x=0.5, y=-0.05, xanchor="center", yanchor="top")]
+        exp = explainer.explain_instance(
+            x_instance, model.predict_proba, num_features=5, top_labels=1
         )
-        st.plotly_chart(fig, use_container_width=True, theme=None)
+        st.subheader("Local Explanation (Top 5 contributions)")
+        df = pd.DataFrame(exp.as_list(), columns=["Feature", "Contribution"])
+        st.table(df)
+    else:
+        st.warning("LIME not available; showing simple feature sensitivity instead.")
+        base = model.predict_proba([x_instance])[0,1]
+        sens = []
+        cols = list(pd.DataFrame(X).columns)
+        for j, name in enumerate(cols):
+            x_mod = x_instance.copy()
+            x_mod[j] = x_mod[j] + 0.1*np.std(X_train[:,j])
+            new = model.predict_proba([x_mod])[0,1]
+            sens.append(new - base)
+        df = pd.DataFrame({"feature": cols, "delta_prob": sens}).sort_values("delta_prob", ascending=False)
+        st.table(df)
+
+    st.markdown("**Takeaway**: LIME provides an intuitive, local surrogate model that explains why this sample was labeled as an anomaly.")
+
+# --------- Demo 3: Predictive Maintenance with Counterfactuals --------- #
+else:
+    st.header("3) Predictive Maintenance (Counterfactuals)")
+    st.write("**Question**: The model predicts failure—*what needs to change to avoid it?* "
+             "We train a simple logistic regression and provide a what-if and counterfactual search.")
+    X, y = gen_maintenance()
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=1, stratify=y)
+
+    pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegression(max_iter=1000))
+    ])
+    pipe.fit(X_train, y_train)
+    preds = pipe.predict_proba(X_test)[:,1]
+    st.write(f"**Accuracy**: {accuracy_score(y_test, (preds>0.5).astype(int)):.3f} • **ROC-AUC**: {roc_auc_score(y_test, preds):.3f}")
+
+    st.subheader("What-if controls")
+    c1, c2, c3, c4 = st.columns(4)
+    temp = c1.slider("temp_c", float(X["temp_c"].min()), float(X["temp_c"].max()), float(np.median(X["temp_c"])))
+    vib = c2.slider("vibration_hz", float(X["vibration_hz"].min()), float(X["vibration_hz"].max()), float(np.median(X["vibration_hz"])))
+    press = c3.slider("pressure_bar", float(X["pressure_bar"].min()), float(X["pressure_bar"].max()), float(np.median(X["pressure_bar"])))
+    age = c4.slider("age_years", float(X["age_years"].min()), float(X["age_years"].max()), float(np.median(X["age_years"])))
+
+    x_cur = pd.DataFrame([[temp, vib, press, age]], columns=X.columns)
+    prob_fail = pipe.predict_proba(x_cur)[0,1]
+    st.metric("Predicted Failure Probability", f"{prob_fail:.2%}")
+
+    st.subheader("Find a simple counterfactual")
+    target_prob = st.slider("Target max failure probability", 0.01, 0.49, 0.20, 0.01)
+
+    # Greedy counterfactual: nudge features along direction that reduces failure prob
+    # Use model coefficients (in standardized space) to get influence directions
+    scaler = pipe.named_steps["scaler"]
+    clf = pipe.named_steps["clf"]
+    coefs = clf.coef_[0]
+
+    def to_std(x_df):
+        return (x_df.values - scaler.mean_) / np.sqrt(scaler.var_)
+
+    def to_orig(x_std):
+        return x_std * np.sqrt(scaler.var_) + scaler.mean_
+
+    x_std = to_std(x_cur)
+    cur_prob = prob_fail
+    steps = []
+    max_iters = 200
+    lr = 0.1  # step size in standardized space
+
+    bounds = np.array([[X[c].min(), X[c].max()] for c in X.columns])
+
+    for it in range(max_iters):
+        if cur_prob <= target_prob:
+            break
+        # Move opposite to positive coefficients (reduce logit)
+        direction = -np.sign(coefs)
+        x_std = x_std + lr * direction  # nudge each feature
+        # Project back to original bounds
+        x_new = to_orig(x_std)[0]
+        x_new = np.clip(x_new, bounds[:,0], bounds[:,1])
+        x_std = (x_new - scaler.mean_) / np.sqrt(scaler.var_)
+        prob = pipe.predict_proba(pd.DataFrame([x_new], columns=X.columns))[0,1]
+        steps.append((it+1, x_new.copy(), prob))
+
+        # Reduce step size if oscillating
+        if len(steps)>2 and steps[-1][2] > steps[-2][2]:
+            lr *= 0.5
+        cur_prob = prob
+
+    if steps:
+        iters, xs, probs = zip(*steps)
+        best_idx = int(np.argmin(probs))
+        x_cf = xs[best_idx]
+        p_cf = probs[best_idx]
+        df_compare = pd.DataFrame([x_cur.iloc[0].values, x_cf], columns=X.columns, index=["current","counterfactual"]).T
+        st.write("**Suggested counterfactual changes** (minimal greedy):")
+        st.dataframe(df_compare.style.format("{:.2f}"))
+        st.metric("Counterfactual Failure Probability", f"{p_cf:.2%}")
+        st.caption("Note: Simple greedy search; for production, consider DiCE or optimization-based counterfactuals with cost/feasibility constraints.")
+    else:
+        st.info("Current configuration already below the target failure probability.")
+
+    st.markdown("**Takeaway**: Counterfactuals provide actionable guidance — what needs to change to lower risk.")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("**How this maps to your lectures**")
+st.sidebar.markdown('''
+- Lecture 1: Motivation & Trustworthy AI framing
+- Lecture 2: Methods (TreeSHAP, LIME) + Demos 1 & 2
+- Lecture 3: Actionability & Future (Counterfactuals) + Demo 3
+''')
