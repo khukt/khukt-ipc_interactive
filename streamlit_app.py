@@ -8,17 +8,16 @@ import warnings
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import shap
 import streamlit as st
 import pydeck as pdk
 import lightgbm as lgb
 from lightgbm import LGBMClassifier
-from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, brier_score_loss
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-# Silence a noisy SHAP warning
+# Silence noisy SHAP warning
 warnings.filterwarnings(
     "ignore",
     message="LightGBM binary classifier .* TreeExplainer shap values output has changed to a list of ndarray",
@@ -55,16 +54,43 @@ class Config:
 
 CFG = Config()
 
-# Telemetry features (base + integrity/freshness + Wi-Fi/Jam)
+# Base/raw metrics we synthesize
 RAW_FEATURES = [
     "rssi","snr","packet_loss","latency_ms","jitter_ms",
     "pos_error_m","auth_fail_rate","crc_err","throughput_mbps","channel_util",
-    # Integrity / freshness / semantics
     "payload_entropy","ts_skew_s","seq_gap","dup_ratio","schema_violation_rate","hmac_fail_rate",
-    # Wi-Fi breach & jamming signals
     "noise_floor_dbm","cca_busy_frac","phy_error_rate","beacon_miss_rate","deauth_rate",
     "assoc_churn","eapol_retry_rate","dhcp_fail_rate","rogue_rssi_gap"
 ]
+
+# Friendly descriptions used in UI
+FEATURE_GLOSSARY = {
+    "snr": "Signal-to-Noise Ratio (dB): link quality",
+    "packet_loss": "Packet loss (%): delivery failures",
+    "latency_ms": "Network latency (ms)",
+    "jitter_ms": "Latency variation (ms)",
+    "pos_error_m": "GNSS position error (m)",
+    "noise_floor_dbm": "RF noise floor (dBm)",
+    "cca_busy_frac": "Channel busy fraction",
+    "phy_error_rate": "PHY layer error rate",
+    "beacon_miss_rate": "Missed AP beacons",
+    "deauth_rate": "Deauthentication bursts",
+    "assoc_churn": "Association / roaming churn",
+    "eapol_retry_rate": "802.1X (EAPOL) retries",
+    "dhcp_fail_rate": "DHCP failure rate",
+    "rogue_rssi_gap": "Rogue AP signal − AP signal",
+    "payload_entropy": "Payload entropy (randomness)",
+    "ts_skew_s": "Timestamp skew (s) vs wall clock",
+    "seq_gap": "Sequence gap ratio",
+    "dup_ratio": "Duplicate payload ratio",
+    "schema_violation_rate": "Payload schema violations",
+    "hmac_fail_rate": "Signature (HMAC) failures",
+    "throughput_mbps": "Throughput (Mb/s)",
+    "channel_util": "Channel utilization (%)",
+    "rssi": "Received signal strength (dBm)",
+    "auth_fail_rate": "Auth failures",
+    "crc_err": "CRC errors (count)"
+}
 
 DEVICE_TYPES = ["AMR", "Truck", "Sensor", "Gateway"]
 MOBILE_TYPES = {"AMR", "Truck"}
@@ -111,7 +137,7 @@ with st.sidebar:
     if st.session_state.get("suggested_threshold") is not None:
         if st.button(f"Apply suggested threshold ({st.session_state.suggested_threshold:.2f})"):
             st.session_state.th_slider = float(st.session_state.suggested_threshold)
-    st.caption("Alerts fire when model probability exceeds this threshold.")
+    st.caption("Alerts fire when model probability ≥ threshold; p-value refines severity when enabled.")
 
     st.divider()
     st.subheader("Display & Access")
@@ -164,9 +190,24 @@ def time_of_day_load(tick):
 
 def fmt_eta(seconds):
     if seconds is None or not np.isfinite(seconds): return "—"
-    seconds = max(0, int(seconds))
-    m, s = divmod(seconds, 60)
+    seconds = max(0, int(seconds)); m, s = divmod(seconds, 60)
     return f"{m:02d}:{s:02d}"
+
+def glossary_line(feature_key):
+    base = feature_key.split("_")[0]
+    return FEATURE_GLOSSARY.get(base, base)
+
+def why_this_alert_plain(reasons):
+    # Convert top feature impacts into a short, user-friendly explanation
+    lines=[]
+    for r in reasons[:4]:
+        fk = r["feature"]
+        base = fk.split("_")[0]
+        desc = FEATURE_GLOSSARY.get(base, base).split(":")[0]
+        impact = r["impact"]
+        trend = "unusually high" if impact>0 else "unusually low"
+        lines.append(f"- {desc} looked **{trend}** (impact {impact:+.2f}).")
+    return "\n".join(lines) if lines else "Model saw unusual patterns across multiple signals."
 
 # =========================
 # Session init
@@ -200,6 +241,7 @@ def init_state():
 
     st.session_state.dev_buf = {row.device_id: deque(maxlen=CFG.rolling_len) for _, row in st.session_state.devices.iterrows()}
     st.session_state.last_features = {}
+    st.session_state.latest_probs = {}          # device_id -> prob (cached each tick)
     st.session_state.fleet_records = deque(maxlen=CFG.max_plot_points)
     st.session_state.incidents = []
     st.session_state.group_incidents = []
@@ -208,9 +250,11 @@ def init_state():
     st.session_state.explainer = None
     st.session_state.conformal_scores = None
     st.session_state.metrics = {}
+    st.session_state.eval = {}                 # y_test, te_p, brier
     st.session_state.last_train_secs = None
     st.session_state.suggested_threshold = None
     st.session_state.seq_counter = {row.device_id: 0 for _, row in st.session_state.devices.iterrows()}
+    st.session_state.spoof_target_id = None
 
 if "devices" not in st.session_state or reset:
     init_state()
@@ -232,9 +276,6 @@ def update_positions(df):
 
 def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=True, training=False,
                          jam_mode=None, breach_mode=None):
-    """
-    Generate correlated metrics based on distances and load for the selected scenario.
-    """
     if scen is None: scen = scenario
     if jam_mode is None: jam_mode = st.session_state.get("jam_mode")
     if breach_mode is None: breach_mode = st.session_state.get("breach_mode")
@@ -250,13 +291,13 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
     d_spf = haversine_m(row.lat, row.lon, spf["lat"], spf["lon"])
     load  = time_of_day_load(tick)
 
-    # ---------- Base RF / network ----------
+    # Base RF / network
     rssi = -40 - 18 * math.log10(d_ap) + np.random.normal(0, 2)
     rssi = float(np.clip(rssi, -90, -40))
     base_snr = 35 - 0.008 * d_ap + np.random.normal(0, 1.5)
     jam_penalty = 0.0
 
-    # ---------- Baseline Wi-Fi/PHY signals ----------
+    # Baseline Wi-Fi/PHY
     noise_floor_dbm = -95 + 5*load + np.random.normal(0, 1.5)
     cca_busy_frac   = float(np.clip(0.20*load + np.random.normal(0,0.03), 0.0, 0.95))
     phy_error_rate  = float(np.clip(np.random.beta(1, 60), 0.0, 0.3))
@@ -267,26 +308,26 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
     dhcp_fail_rate  = float(np.clip(np.random.beta(1,200), 0.0, 1.0))
     rogue_rssi_gap  = -30.0  # rogue AP weaker by default
 
-    # ---------- Jamming realism ----------
+    # Jamming realism
     if str(scen).startswith("Jamming") and d_jam <= CFG.jam_radius_m:
         factor = max(0.15, 1.0 - d_jam/CFG.jam_radius_m)
         if jam_mode == "Broadband noise" or jam_mode is None:
-            jam_penalty += np.random.uniform(8, 15) * factor
+            jam_penalty     += np.random.uniform(8, 15) * factor
             noise_floor_dbm += np.random.uniform(8, 15) * factor
-            cca_busy_frac   = float(np.clip(cca_busy_frac + 0.25*factor + 0.15*np.random.rand(), 0, 0.98))
-            phy_error_rate  = float(np.clip(phy_error_rate + 0.15*factor + 0.10*np.random.rand(), 0, 0.9))
-            beacon_miss_rate= float(np.clip(beacon_miss_rate + 0.10*factor + 0.10*np.random.rand(), 0, 1.0))
+            cca_busy_frac    = float(np.clip(cca_busy_frac + 0.25*factor + 0.15*np.random.rand(), 0, 0.98))
+            phy_error_rate   = float(np.clip(phy_error_rate + 0.15*factor + 0.10*np.random.rand(), 0, 0.9))
+            beacon_miss_rate = float(np.clip(beacon_miss_rate + 0.10*factor + 0.10*np.random.rand(), 0, 1.0))
         elif jam_mode == "Reactive":
             util = (0.4+0.5*load)
-            jam_penalty += np.random.uniform(4, 9) * factor * util
+            jam_penalty     += np.random.uniform(4, 9) * factor * util
             noise_floor_dbm += np.random.uniform(4, 9) * factor * util
-            cca_busy_frac   = float(np.clip(cca_busy_frac + 0.15*factor*util + 0.05*np.random.rand(), 0, 0.98))
-            phy_error_rate  = float(np.clip(phy_error_rate + 0.20*factor*util, 0, 0.9))
-            beacon_miss_rate= float(np.clip(beacon_miss_rate + 0.06*factor*util, 0, 1.0))
+            cca_busy_frac    = float(np.clip(cca_busy_frac + 0.15*factor*util + 0.05*np.random.rand(), 0, 0.98))
+            phy_error_rate   = float(np.clip(phy_error_rate + 0.20*factor*util, 0, 0.9))
+            beacon_miss_rate = float(np.clip(beacon_miss_rate + 0.06*factor*util, 0, 1.0))
         else:  # Mgmt (deauth)
-            deauth_rate     = float(np.clip(deauth_rate + 0.40*factor + 0.20*np.random.rand(), 0, 1.0))
-            assoc_churn     = float(np.clip(assoc_churn + 0.35*factor + 0.15*np.random.rand(), 0, 1.0))
-            beacon_miss_rate= float(np.clip(beacon_miss_rate + 0.12*factor, 0, 1.0))
+            deauth_rate      = float(np.clip(deauth_rate + 0.40*factor + 0.20*np.random.rand(), 0, 1.0))
+            assoc_churn      = float(np.clip(assoc_churn + 0.35*factor + 0.15*np.random.rand(), 0, 1.0))
+            beacon_miss_rate = float(np.clip(beacon_miss_rate + 0.12*factor, 0, 1.0))
             jam_penalty     += np.random.uniform(0, 3) * factor
 
     snr = max(0.0, base_snr - jam_penalty)
@@ -299,21 +340,17 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
     # Latency & jitter
     latency = 20 + 2.0*loss + 30*load + np.random.normal(0, 6)
     jitter  = 1.0 + 0.05*loss + 8*load + np.random.normal(0, 1.0)
-    latency = float(max(3, latency))
-    jitter  = float(max(0.2, jitter))
+    latency = float(max(3, latency)); jitter = float(max(0.2, jitter))
 
-    # Throughput
-    thr = 90 - 0.8*loss - 40*load + np.random.normal(0, 5)
-    thr = float(max(1, thr))
-
-    # Channel util
+    # Throughput & channel util
+    thr = float(max(1, 90 - 0.8*loss - 40*load + np.random.normal(0, 5)))
     channel_util = float(np.clip(100*(0.4+0.5*load) + 100*(cca_busy_frac-0.15) + np.random.normal(0, 5), 0, 100))
 
     # Auth baseline & CRC baseline
     auth_fail = np.random.exponential(0.05)
     crc_err   = int(np.random.poisson(0.2))
 
-    # ---------- Wi-Fi breach realism ----------
+    # Wi-Fi breach realism
     if str(scen).startswith("Wi-Fi Breach") and d_rog <= CFG.breach_radius_m:
         if row.type in MOBILE_TYPES or np.random.rand()<0.3:
             rog_rssi = -40 - 18 * math.log10(max(1.0, d_rog)) + np.random.normal(0, 2)
@@ -330,15 +367,10 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
                 eapol_retry_rate = float(np.clip(eapol_retry_rate + np.random.uniform(0.35, 0.70), 0, 1.0))
                 auth_fail        += np.random.uniform(0.4, 0.9)
 
-    # ---------- GPS Spoofing realism (for TRAINING only here) ----------
+    # GPS Spoofing realism (training path handled later)
     pos_error = np.random.normal(2.0, 0.7)
-    if str(scen).startswith("GPS Spoofing") and training:
-        minutes = tick / 60.0
-        bias = 20.0
-        drift = 6.0 * minutes
-        pos_error += np.random.uniform(0.6*bias, 1.2*bias) + 0.5*drift
 
-    # ---------- Data Tamper realism ----------
+    # Data Tamper realism
     if "seq_counter" not in st.session_state:
         st.session_state.seq_counter = {}
     if row.device_id not in st.session_state.seq_counter:
@@ -382,8 +414,15 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
             schema_violation_rate += float(np.random.uniform(0.30, 0.70))
             payload_entropy = float(np.random.uniform(4.5, 6.0))
 
+    # GPS spoofing boost (TRAINING synthetic path)
+    if str(scen).startswith("GPS Spoofing") and training:
+        minutes = tick / 60.0
+        bias = 20.0
+        drift = 6.0 * minutes
+        pos_error += np.random.uniform(0.6*bias, 1.2*bias) + 0.5*drift
+
     return dict(
-        rssi=float(rssi), snr=float(snr),
+        rssi=float(rssi), snr=float(max(0.0, base_snr - jam_penalty)),
         packet_loss=float(loss), latency_ms=float(latency), jitter_ms=float(jitter),
         pos_error_m=float(max(0.3, pos_error)),
         auth_fail_rate=float(max(0, auth_fail)),
@@ -437,7 +476,7 @@ def feature_cols():
     return cols
 
 # =========================
-# Training (with progress & ETA)
+# Training (with progress, ETA, and eval stashing)
 # =========================
 def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
     lat0, lon0 = CFG.site_center
@@ -472,6 +511,7 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
         elif scen_code=="Tamper":sc="Data Tamper (gateway)"; jm=bm=None
         else:                    sc="Normal"; jm=bm=None
 
+        # Move devices
         for i in D.index:
             if D.at[i,"type"] in MOBILE_TYPES:
                 D.at[i,"heading"] += np.random.normal(0,0.3)
@@ -487,7 +527,7 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
 
         for _, row in D.iterrows():
             fake_row = type("R",(object,),row.to_dict())()
-            metrics = rf_and_network_model(
+            m = rf_and_network_model(
                 fake_row, t, sc,
                 tamper_mode=None,
                 crypto_enabled=bool(np.random.rand()<0.7),
@@ -495,7 +535,7 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
                 jam_mode=(jm if "Jamming" in sc else None),
                 breach_mode=(bm if "Wi-Fi Breach" in sc else None)
             )
-            buf[row.device_id].append(metrics)
+            buf[row.device_id].append(m)
             feats = build_window_features(buf[row.device_id])
             if feats:
                 X_rows.append(feats)
@@ -558,13 +598,14 @@ def train_model_with_progress(n_ticks=350):
 
     update(95, "Calibrating confidence…")
     cal_p = model.predict_proba(Xca_df)[:,1]
-    cal_nc = 1 - np.where(y_cal==1, cal_p, 1-cal_p)
+    cal_nc = 1 - np.where(y_cal==1, cal_p, 1-cal_p)  # nonconformity scores
 
     update(97, "Evaluating metrics…")
     te_p = model.predict_proba(Xte_df)[:,1]
     preds=(te_p>=CFG.threshold).astype(int)
     prec,rec,f1,_ = precision_recall_fscore_support(y_test,preds,average="binary",zero_division=0)
     auc = roc_auc_score(y_test, te_p)
+    brier = brier_score_loss(y_test, te_p)
 
     ths = np.linspace(0.30, 0.90, 61)
     best_f1, best_th = 0.0, CFG.threshold
@@ -575,19 +616,21 @@ def train_model_with_progress(n_ticks=350):
             best_f1, best_th = f1c, th
     st.session_state.suggested_threshold = float(best_th)
 
+    # Stash in session
     st.session_state.model=model
     st.session_state.scaler=scaler
     st.session_state.explainer=shap.TreeExplainer(model)
     st.session_state.conformal_scores=cal_nc
-    st.session_state.metrics={"precision":prec,"recall":rec,"f1":f1,"auc":auc}
+    st.session_state.metrics={"precision":prec,"recall":rec,"f1":f1,"auc":auc,"brier":brier}
     st.session_state.baseline = Xall_df
+    st.session_state.eval = {"y_test": y_test, "te_p": te_p, "brier": brier}
 
     total_secs = time.time()-t_start
     st.session_state.last_train_secs = total_secs
     bar.progress(100, text=f"Training complete • {int(total_secs)}s")
     note.success(
         f"Model trained: AUC={auc:.2f}, Precision={prec:.2f}, Recall={rec:.2f} • "
-        f"Duration {int(total_secs)}s • Suggested threshold={best_th:.2f}"
+        f"Brier={brier:.3f} • Duration {int(total_secs)}s • Suggested threshold={best_th:.2f}"
     )
 
 if (CFG.retrain_on_start and st.session_state.get("model") is None) or retrain:
@@ -600,16 +643,17 @@ def conformal_pvalue(prob):
     return float((np.sum(cal>=nc)+1)/(len(cal)+1))
 
 # =========================
-# Streaming tick
+# Streaming tick (batch-optimized)
 # =========================
 def tick_once():
     st.session_state.devices = update_positions(st.session_state.devices.copy())
     tick = st.session_state.tick
 
-    if "spoof_target_id" not in st.session_state:
+    if st.session_state.spoof_target_id is None:
         st.session_state.spoof_target_id = np.random.choice(st.session_state.devices["device_id"])
 
     fleet_rows=[]
+    # Generate metrics + windows
     for _, row in st.session_state.devices.iterrows():
         m = rf_and_network_model(
             row, tick, scenario,
@@ -620,69 +664,81 @@ def tick_once():
             breach_mode=st.session_state.get("breach_mode")
         )
 
+        # Apply live GPS spoofing effect
         if scenario.startswith("GPS Spoofing"):
             spf = st.session_state.spoofer
             d_spf = haversine_m(row.lat, row.lon, spf["lat"], spf["lon"])
-            selected = st.session_state.get("spoof_mode", "Localized area")
+            scope = st.session_state.get("spoof_mode", "Localized area")
             mobile_only = st.session_state.get("spoof_mobile_only", True)
-
-            hit = False
-            if selected == "Site-wide":
-                hit = True
-            elif selected == "Single device":
-                hit = (row.device_id == st.session_state.spoof_target_id)
-            else:
-                hit = (d_spf <= CFG.spoof_radius_m)
-
+            hit = (scope=="Site-wide") or \
+                  (scope=="Single device" and row.device_id==st.session_state.spoof_target_id) or \
+                  (scope=="Localized area" and d_spf <= CFG.spoof_radius_m)
             if hit and (not mobile_only or row.type in MOBILE_TYPES):
                 minutes = tick / 60.0
                 bias = 20.0
                 drift = 6.0 * minutes
-                scale = 1.0
-                if selected == "Localized area":
-                    scale = max(0.15, 1.0 - d_spf/CFG.spoof_radius_m)
+                scale = 1.0 if scope!="Localized area" else max(0.15, 1.0 - d_spf/CFG.spoof_radius_m)
                 m["pos_error_m"] += scale * (np.random.uniform(0.6*bias, 1.2*bias) + 0.5*drift)
 
         st.session_state.dev_buf[row.device_id].append(m)
         rec = {"tick":tick, "device_id":row.device_id, "type":row.type, "lat":row.lat, "lon":row.lon, **m}
         fleet_rows.append(rec)
 
-    incidents_this_tick=[]
+    # Build features for all devices that have enough samples
+    device_ids=[]
+    feats_list=[]
     for _, row in st.session_state.devices.iterrows():
         feats = build_window_features(st.session_state.dev_buf[row.device_id])
-        if not feats: continue
-        st.session_state.last_features[row.device_id] = feats
-        X = pd.DataFrame([feats]).fillna(0.0)
-        Xs = st.session_state.scaler.transform(X)
-        Xs_df = to_df(Xs, X.columns)
-        prob = float(st.session_state.model.predict_proba(Xs_df)[:,1][0])
-        pval = conformal_pvalue(prob) if use_conformal else None
-        sev,_ = severity(prob,pval)
-        if prob>=CFG.threshold:
-            shap_mat = shap_pos(st.session_state.explainer, Xs_df)
-            shap_vec = shap_mat[0]
-            pairs = sorted(list(zip(X.columns, shap_vec)), key=lambda x: abs(x[1]), reverse=True)[:6]
-            inc = dict(
-                ts=int(time.time()), tick=tick, device_id=row.device_id, type=row.type,
-                lat=row.lat, lon=row.lon, scenario=scenario,
-                prob=prob, p_value=pval, severity=sev,
-                features=feats,  # snapshot for per-incident Device Inspector
-                reasons=[{"feature":k,"impact":float(v)} for k,v in pairs]
-            )
-            st.session_state.incidents.append(inc)
-            incidents_this_tick.append(inc)
+        if feats:
+            st.session_state.last_features[row.device_id] = feats
+            device_ids.append(row.device_id)
+            feats_list.append(feats)
 
+    # Batch predict
+    incidents_this_tick=[]
+    st.session_state.latest_probs.clear()
+    if feats_list:
+        X = pd.DataFrame(feats_list).fillna(0.0)
+        Xs = st.session_state.scaler.transform(X)
+        probs = st.session_state.model.predict_proba(Xs)[:,1]
+        for did, p in zip(device_ids, probs):
+            st.session_state.latest_probs[did] = float(p)
+
+        # Trigger incidents only for those above threshold (compute SHAP in batch)
+        idx_alert = np.where(probs >= CFG.threshold)[0]
+        if len(idx_alert)>0:
+            shap_vals = shap_pos(st.session_state.explainer, to_df(Xs, X.columns).iloc[idx_alert])
+            # Ensure correct shape
+            shap_arr = np.array(shap_vals)
+            if shap_arr.ndim == 1:
+                shap_arr = shap_arr[:, None]
+
+            for j, idx in enumerate(idx_alert):
+                did = device_ids[idx]
+                row = st.session_state.devices[st.session_state.devices["device_id"]==did].iloc[0]
+                prob = float(probs[idx])
+                pval = conformal_pvalue(prob) if use_conformal else None
+                sev,_ = severity(prob, pval)
+                shap_vec = shap_arr[j]
+                pairs = sorted(list(zip(X.columns, shap_vec)), key=lambda kv: abs(kv[1]), reverse=True)[:6]
+                inc = dict(
+                    ts=int(time.time()), tick=tick,
+                    device_id=did, type=row.type, lat=row.lat, lon=row.lon,
+                    scenario=scenario, prob=prob, p_value=pval, severity=sev,
+                    features=st.session_state.last_features[did],
+                    reasons=[{"feature":k,"impact":float(v)} for k,v in pairs]
+                )
+                st.session_state.incidents.append(inc)
+                incidents_this_tick.append(inc)
+
+    # Group incident (site-level) if many affected
     if incidents_this_tick:
         affected = {i["device_id"] for i in incidents_this_tick}
         ratio = len(affected)/len(st.session_state.devices)
         if ratio>=0.25:
             st.session_state.group_incidents.append({
-                "ts": int(time.time()),
-                "tick": tick,
-                "scenario": scenario,
-                "affected": len(affected),
-                "fleet": len(st.session_state.devices),
-                "ratio": ratio,
+                "ts": int(time.time()), "tick": tick, "scenario": scenario,
+                "affected": len(affected), "fleet": len(st.session_state.devices), "ratio": ratio,
             })
 
     st.session_state.fleet_records.extend(fleet_rows)
@@ -696,6 +752,41 @@ if st.session_state.get("model") is not None:
         if st.button("Step once"): tick_once()
 
 # =========================
+# Transparency banner (always visible)
+# =========================
+with st.container():
+    m = st.session_state.metrics or {}
+    cols = st.columns([1.2,1,1,1,1,1.2])
+    cols[0].markdown("### Detection Engine")
+    cols[1].metric("Model", "LightGBM")
+    cols[2].metric("Window", f"{CFG.rolling_len} ticks")
+    cols[3].metric("Features", f"{len(feature_cols())}")
+    cols[4].metric("Threshold", f"{CFG.threshold:.2f}")
+    cols[5].metric("Conformal", "On" if st.session_state.get("conformal_scores") is not None and use_conformal else "Off")
+
+    with st.expander("How detection works"):
+        st.markdown(
+            """
+**Pipeline**: Rolling-window feature engineering → **LightGBM** (binary classifier) → probability `p`  
+**Rule**: Raise incident when `p ≥ threshold` (currently shown above).  
+**Confidence** (optional): Conformal calibration computes a p-value for the alert.  
+**Interpretability**: We use **SHAP** for local feature attributions at alert time and global importance in *Insights*.
+            """
+        )
+        st.markdown("**Hyperparameters**")
+        st.json({
+            "n_estimators": CFG.n_estimators,
+            "max_depth": CFG.max_depth,
+            "learning_rate": CFG.learning_rate,
+            "min_child_samples": 12,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9
+        })
+        if m:
+            st.markdown("**Training metrics**")
+            st.json(m)
+
+# =========================
 # KPIs
 # =========================
 k1,k2,k3,k4,k5 = st.columns(5)
@@ -705,17 +796,15 @@ with k3:
     auc = (st.session_state.metrics or {}).get("auc", 0)
     st.metric("Model AUC", f"{auc:.2f}")
 with k4:
-    probs=[]
-    for _, feats in st.session_state.last_features.items():
-        X=pd.DataFrame([feats]); Xs=st.session_state.scaler.transform(X); Xs_df=to_df(Xs,X.columns)
-        probs.append(float(st.session_state.model.predict_proba(Xs_df)[:,1][0]))
+    # Use cached latest_probs from this tick (fast)
+    probs = list(st.session_state.latest_probs.values())
     st.metric("Fleet risk (mean prob)", f"{(np.mean(probs) if probs else 0):.2f}")
 with k5:
     train_secs = st.session_state.get("last_train_secs")
     st.metric("Last train duration", f"{int(train_secs)}s" if train_secs else "—")
 
 # =========================
-# SHAP renderer to reuse in incidents
+# SHAP renderer for incidents (snapshot)
 # =========================
 def render_device_inspector_from_incident(inc, topk=8):
     feats = inc.get("features") or st.session_state.last_features.get(inc["device_id"])
@@ -726,7 +815,7 @@ def render_device_inspector_from_incident(inc, topk=8):
     Xs = st.session_state.scaler.transform(X)
     Xs_df = to_df(Xs, X.columns)
     prob = float(st.session_state.model.predict_proba(Xs_df)[:, 1][0])
-    pval = conformal_pvalue(prob) if st.session_state.get("conformal_scores") is not None else None
+    pval = conformal_pvalue(prob) if st.session_state.get("conformal_scores") is not None and st.session_state.get("conformal_scores") is not None else None
 
     c1, c2 = st.columns(2)
     with c1: st.metric("Current risk (prob)", f"{prob:.2f}")
@@ -757,24 +846,18 @@ with tab_overview:
             if type_filter and len(type_filter) < len(DEVICE_TYPES):
                 df_map = df_map[df_map["type"].isin(type_filter)].copy()
 
-            risks, snrs, losses = [], [], []
+            # Use cached probs; fall back to 0.0
+            df_map["risk"] = df_map["device_id"].map(st.session_state.latest_probs).fillna(0.0)
+            # Pull latest metrics for tooltip
+            snrs, losses = [], []
             for _, r in df_map.iterrows():
-                feats = st.session_state.last_features.get(r.device_id, {})
-                if feats:
-                    X = pd.DataFrame([feats]); Xs = st.session_state.scaler.transform(X); Xs_df = to_df(Xs, X.columns)
-                    risks.append(float(st.session_state.model.predict_proba(Xs_df)[:, 1][0]))
-                else:
-                    risks.append(0.0)
                 buf = st.session_state.dev_buf.get(r.device_id, [])
                 if buf and len(buf) > 0:
                     snrs.append(float(buf[-1].get("snr", np.nan)))
                     losses.append(float(buf[-1].get("packet_loss", np.nan)))
                 else:
                     snrs.append(np.nan); losses.append(np.nan)
-
-            df_map["risk"] = risks
-            df_map["snr"] = snrs
-            df_map["packet_loss"] = losses
+            df_map["snr"] = snrs; df_map["packet_loss"] = losses
 
             type_colors = {
                 "AMR":     [0, 128, 255, 220],
@@ -794,7 +877,7 @@ with tab_overview:
                           get_color=[20,20,20,255], get_size=12, get_alignment_baseline="'top'", get_pixel_offset=[0,10]),
             ]
 
-            # AP marker
+            # Overlays
             ap_df = pd.DataFrame([{"lat": st.session_state.ap["lat"], "lon": st.session_state.ap["lon"], "label": "AP"}])
             layers += [
                 pdk.Layer("ScatterplotLayer", data=ap_df, get_position='[lon, lat]',
@@ -803,7 +886,15 @@ with tab_overview:
                           get_color=[30,144,255,255], get_size=14, get_alignment_baseline="'bottom'", get_pixel_offset=[0,-10]),
             ]
 
-            # Jammer overlay
+            def circle_layer(center, radius_m, color):
+                angles = np.linspace(0, 2*np.pi, 60)
+                lat_mean = float(st.session_state.devices.lat.mean())
+                path = [[
+                    center["lon"] + meters_to_latlon_offset(radius_m * math.sin(a), radius_m * math.cos(a), lat_mean)[1],
+                    center["lat"] + meters_to_latlon_offset(radius_m * math.sin(a), radius_m * math.cos(a), lat_mean)[0]
+                ] for a in angles]
+                return pdk.Layer("PathLayer", [{"path": path}], get_path="path", get_color=color, width_scale=4, width_min_pixels=1, opacity=0.25)
+
             if scenario.startswith("Jamming"):
                 jam = st.session_state.jammer
                 jam_df = pd.DataFrame([{"lat": jam["lat"], "lon": jam["lon"], "label": "Jammer"}])
@@ -812,19 +903,8 @@ with tab_overview:
                               get_fill_color='[255,0,0,240]', get_radius=10),
                     pdk.Layer("TextLayer", data=jam_df, get_position='[lon, lat]', get_text='label',
                               get_color=[255,0,0,255], get_size=14, get_alignment_baseline="'bottom'", get_pixel_offset=[0,-10]),
+                    circle_layer(jam, CFG.jam_radius_m, [255,0,0])
                 ]
-                angles = np.linspace(0, 2*np.pi, 60)
-                circle = [{"path": [[
-                    jam["lon"] + meters_to_latlon_offset(CFG.jam_radius_m * math.sin(a),
-                                                         CFG.jam_radius_m * math.cos(a),
-                                                         st.session_state.devices.lat.mean())[1],
-                    jam["lat"] + meters_to_latlon_offset(CFG.jam_radius_m * math.sin(a),
-                                                         CFG.jam_radius_m * math.cos(a),
-                                                         st.session_state.devices.lat.mean())[0]
-                ] for a in angles]}]
-                layers.append(pdk.Layer("PathLayer", circle, get_path="path", get_color=[255,0,0], width_scale=4, width_min_pixels=1, opacity=0.25))
-
-            # Rogue AP overlay
             if scenario.startswith("Wi-Fi Breach"):
                 rog = st.session_state.rogue
                 rog_df = pd.DataFrame([{"lat": rog["lat"], "lon": rog["lon"], "label": "Rogue AP"}])
@@ -833,26 +913,8 @@ with tab_overview:
                               get_fill_color='[0,255,255,240]', get_radius=10),
                     pdk.Layer("TextLayer", data=rog_df, get_position='[lon, lat]', get_text='label',
                               get_color=[0,200,200,255], get_size=14, get_alignment_baseline="'bottom'", get_pixel_offset=[0,-10]),
+                    circle_layer(rog, CFG.breach_radius_m, [0,200,200])
                 ]
-                angles = np.linspace(0, 2*np.pi, 60)
-                circle = [{"path": [[
-                    rog["lon"] + meters_to_latlon_offset(
-                        CFG.breach_radius_m * math.sin(a),
-                        CFG.breach_radius_m * math.cos(a),
-                        st.session_state.devices.lat.mean()
-                    )[1],
-                    rog["lat"] + meters_to_latlon_offset(
-                        CFG.breach_radius_m * math.sin(a),
-                        CFG.breach_radius_m * math.cos(a),
-                        st.session_state.devices.lat.mean()
-                    )[0]
-                ] for a in angles]}]
-                layers.append(
-                    pdk.Layer("PathLayer", circle, get_path="path",
-                              get_color=[0, 200, 200], width_scale=4, width_min_pixels=1, opacity=0.25)
-                )
-
-            # Spoofer overlay
             if scenario.startswith("GPS Spoofing"):
                 spf = st.session_state.spoofer
                 spf_df = pd.DataFrame([{"lat": spf["lat"], "lon": spf["lon"], "label": "Spoofer"}])
@@ -861,17 +923,8 @@ with tab_overview:
                               get_fill_color='[255,215,0,240]', get_radius=10),
                     pdk.Layer("TextLayer", data=spf_df, get_position='[lon, lat]', get_text='label',
                               get_color=[255,215,0,255], get_size=14, get_alignment_baseline="'bottom'", get_pixel_offset=[0,-10]),
+                    circle_layer(spf, CFG.spoof_radius_m, [255,215,0])
                 ]
-                angles = np.linspace(0, 2*np.pi, 60)
-                circle = [{"path": [[
-                    spf["lon"] + meters_to_latlon_offset(CFG.spoof_radius_m * math.sin(a),
-                                                         CFG.spoof_radius_m * math.cos(a),
-                                                         st.session_state.devices.lat.mean())[1],
-                    spf["lat"] + meters_to_latlon_offset(CFG.spoof_radius_m * math.sin(a),
-                                                         CFG.spoof_radius_m * math.cos(a),
-                                                         st.session_state.devices.lat.mean())[0]
-                ] for a in angles]}]
-                layers.append(pdk.Layer("PathLayer", circle, get_path="path", get_color=[255,215,0], width_scale=4, width_min_pixels=1, opacity=0.25))
 
             view_state = pdk.ViewState(
                 latitude=float(st.session_state.devices.lat.mean()),
@@ -880,6 +933,7 @@ with tab_overview:
             )
             tooltip = {"html": "<b>{device_id}</b> • {type}<br/>Risk: {risk}<br/>SNR: {snr} dB<br/>Loss: {packet_loss}%",
                        "style": {"backgroundColor": "rgba(255,255,255,0.95)", "color": "#111"}}
+            # NOTE: pydeck chart still uses use_container_width to avoid width='str' type error
             st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view_state, map_style=None, tooltip=tooltip),
                             use_container_width=True)
 
@@ -915,10 +969,7 @@ with tab_overview:
         leaderboard=[]
         if st.session_state.get("model") is not None:
             for _, r in st.session_state.devices.iterrows():
-                feats=st.session_state.last_features.get(r.device_id)
-                if not feats: continue
-                X=pd.DataFrame([feats]); Xs=st.session_state.scaler.transform(X); Xs_df=to_df(Xs,X.columns)
-                prob=float(st.session_state.model.predict_proba(Xs_df)[:,1][0])
+                prob = st.session_state.latest_probs.get(r.device_id, 0.0)
                 pval=conformal_pvalue(prob) if use_conformal else None
                 sev,_=severity(prob,pval)
                 leaderboard.append({"device_id":r.device_id,"type":r.type,"prob":prob,"p_value":pval,"severity":sev})
@@ -926,8 +977,6 @@ with tab_overview:
             df_lead=pd.DataFrame(leaderboard).sort_values("prob",ascending=False).head(10)
             st.markdown("### Top risk devices")
             st.dataframe(df_lead, use_container_width=True)
-
-        st.caption("Device-level explanations are now embedded within each incident below.")
 
 # ---------- Fleet View
 with tab_fleet:
@@ -958,6 +1007,11 @@ with tab_incidents:
             with st.expander(title):
                 badge=f"<span style='background-color:{color}; color:white; padding:2px 8px; border-radius:8px;'>{sev}</span>"
                 st.markdown(f"**Severity**: {badge}", unsafe_allow_html=True)
+
+                # Plain-language why
+                st.markdown("#### Why this alert?")
+                st.markdown(why_this_alert_plain(inc["reasons"]))
+
                 left,right = st.columns([2,1])
 
                 with left:
@@ -1017,7 +1071,7 @@ with tab_incidents:
                         evidence = {
                             "ts": inc["ts"], "tick": inc["tick"], "device_id": inc["device_id"], "type": inc["type"],
                             "lat": inc["lat"], "lon": inc["lon"], "scenario": inc["scenario"], "severity": inc["severity"],
-                            "prob": inc["prob"], "p_value": inc["p_value"], "model_version": "LightGBM v2.3-demo",
+                            "prob": inc["prob"], "p_value": inc["p_value"], "model_version": "LightGBM v2.5-demo",
                             "explanations": inc["reasons"]
                         }
                         st.download_button(
@@ -1061,36 +1115,45 @@ with tab_insights:
             imp = pd.DataFrame({"feature": base.columns, "mean_abs_shap": mean_abs}).sort_values("mean_abs_shap", ascending=False).head(18)
             fig = px.bar(imp, x="mean_abs_shap", y="feature", orientation="h", title="Global feature impact")
             st.plotly_chart(fig, width='stretch')
+
     with g2:
-        fr = pd.DataFrame(list(st.session_state.fleet_records))
-        if len(fr)>0:
-            a = fr[fr["tick"]<max(1, st.session_state.tick*0.3)]
-            b = fr[fr["tick"]>max(0, st.session_state.tick-200)]
-            cols = ["snr","packet_loss","latency_ms","jitter_ms","pos_error_m","auth_fail_rate","crc_err","throughput_mbps","channel_util",
-                    "noise_floor_dbm","cca_busy_frac","phy_error_rate","deauth_rate","assoc_churn","eapol_retry_rate","dhcp_fail_rate"]
-            drift = []
-            for c in cols:
-                if c not in fr.columns: continue
-                mu_a, mu_b = a[c].mean(), b[c].mean()
-                sd = a[c].std(ddof=0)+1e-6
-                z = (mu_b-mu_a)/sd
-                drift.append({"metric":c, "zshift":z})
-            if drift:
-                df_drift = pd.DataFrame(drift).sort_values("zshift", ascending=False)
-                fig = px.bar(df_drift, x="zshift", y="metric", orientation="h", title="Drift (mean shift vs early window)")
-                st.plotly_chart(fig, width='stretch')
+        st.markdown("### Calibration (reliability)")
+        ev = st.session_state.get("eval") or {}
+        if "te_p" in ev and "y_test" in ev:
+            te_p = np.array(ev["te_p"]); y_test = np.array(ev["y_test"])
+            # 10-bin reliability curve
+            bins = np.linspace(0.0, 1.0, 11)
+            inds = np.digitize(te_p, bins) - 1
+            bin_p, bin_y = [], []
+            for b in range(10):
+                msk = (inds==b)
+                if np.any(msk):
+                    bin_p.append(te_p[msk].mean())
+                    bin_y.append(y_test[msk].mean())
+            df_rel = pd.DataFrame({"confidence": bin_p, "empirical": bin_y})
+            fig = px.line(df_rel, x="confidence", y="empirical", title=f"Reliability (Brier {ev.get('brier', np.nan):.3f})")
+            fig.add_scatter(x=[0,1], y=[0,1], mode="lines", name="perfect")
+            st.plotly_chart(fig, width='stretch')
+        else:
+            st.info("Train (or retrain) to view calibration.")
+
+    st.markdown("### Feature glossary")
+    st.table(pd.DataFrame({"Feature (base)": list(FEATURE_GLOSSARY.keys()),
+                           "Meaning": [FEATURE_GLOSSARY[k] for k in FEATURE_GLOSSARY]}))
 
     st.markdown("### Model card")
     st.json({
-        "model": "LightGBM (depth≤3, ~60 trees)",
+        "model": "LightGBM (binary) on rolling-window features",
         "features_per_device": len(feature_cols()),
+        "window_length": CFG.rolling_len,
+        "detection_rule": f"probability >= {CFG.threshold:.2f}" + (" + conformal p-value for severity" if use_conformal else ""),
         "training_metrics": st.session_state.metrics,
-        "calibration": f"Conformal p-value (target coverage {int(CFG.coverage*100)}%)",
+        "calibration": f"Conformal p-value (target coverage {int(CFG.coverage*100)}%)" if use_conformal else "Disabled",
         "realism": "Distance-based RF, jamming modes, rogue AP behaviors, GNSS spoof scopes, integrity/freshness for tamper",
         "intended_use": "Demonstration of trustworthy anomaly detection in wireless/logistics (Sundsvall/MSU)",
         "limitations": [
             "Synthetic but physics-inspired; not production-ready",
             "Single-site example without true multi-AP roaming"
         ],
-        "version": "v2.4-sundsvall"
+        "version": "v2.5-sundsvall"
     })
