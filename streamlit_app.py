@@ -43,9 +43,9 @@ class Config:
     max_depth: int = 3
     learning_rate: float = 0.08
 
-    # Sundsvall — Mid Sweden University area
-    site_center: tuple = (62.3925, 17.3066)
-    site_radius_m: float = 400
+    # Sundsvall (move inland to avoid water)
+    site_center: tuple = (62.4030, 17.3400)
+    site_radius_m: float = 500
 
     # Scenario radii
     jam_radius_m: float = 200
@@ -75,10 +75,10 @@ FEATURE_GLOSSARY = {
     "phy_error_rate": "PHY-layer error rate: frame decode errors on the radio.",
     "beacon_miss_rate": "Missed AP beacons: losing sync with AP.",
     "deauth_rate": "Deauthentication bursts: classic evil-twin/jam signal.",
-    "assoc_churn": "Association/roaming churn: frequent connects/disconnects.",
-    "eapol_retry_rate": "802.1X retries: auth pressure/credential hammering.",
-    "dhcp_fail_rate": "DHCP failure rate: clients failing to get IP addresses.",
-    "rogue_rssi_gap": "Rogue AP signal − Legit AP signal: >0 means lure is stronger.",
+    "assoc_churn": "Association/roaming churn (or cellular reattach churn).",
+    "eapol_retry_rate": "802.1X retries (or cellular attach/auth retries).",
+    "dhcp_fail_rate": "DHCP failure rate (or session/IP setup failures).",
+    "rogue_rssi_gap": "Rogue node signal − Legit signal: >0 means rogue is more attractive.",
     "payload_entropy": "Payload entropy: randomness; too low/too high can be suspicious.",
     "ts_skew_s": "Timestamp skew (s) vs wall clock: replay/stale hints.",
     "seq_gap": "Sequence gap ratio: missing counters/frames.",
@@ -105,9 +105,16 @@ st.caption("AMR & logistics fleet • RF/network realism • LightGBM + SHAP + C
 # Sidebar
 with st.sidebar:
     st.header("Demo Controls")
+    profile = st.selectbox(
+        "Comms profile",
+        ["Yard (Wi-Fi/private-5G dominant)", "Road (Cellular 5G/LTE dominant)"],
+        index=1
+    )
+    st.session_state["cellular_mode"] = profile.startswith("Road")
+
     scenario = st.selectbox(
         "Scenario",
-        ["Normal", "Jamming (localized)", "Wi-Fi Breach (AP)", "GPS Spoofing (subset)", "Data Tamper (gateway)"],
+        ["Normal", "Jamming (localized)", "Access Breach (AP/gNB)", "GPS Spoofing (subset)", "Data Tamper (gateway)"],
         index=0
     )
 
@@ -116,9 +123,9 @@ with st.sidebar:
     if scenario.startswith("Jamming"):
         jam_mode = st.radio("Jamming type", ["Broadband noise", "Reactive", "Mgmt (deauth)"], index=0, key="jam_mode")
         CFG.jam_radius_m = st.slider("Jam coverage (m)", 50, 500, CFG.jam_radius_m, 10, key="jam_radius")
-    if scenario.startswith("Wi-Fi Breach"):
+    if scenario.startswith("Access Breach"):
         breach_mode = st.radio("Breach mode", ["Evil Twin", "Rogue Open AP", "Credential hammer"], index=0, key="breach_mode")
-        CFG.breach_radius_m = st.slider("Rogue AP lure radius (m)", 50, 300, CFG.breach_radius_m, 10, key="breach_radius")
+        CFG.breach_radius_m = st.slider("Rogue node lure radius (m)", 50, 300, CFG.breach_radius_m, 10, key="breach_radius")
     if scenario.startswith("GPS Spoofing"):
         st.radio("Spoofing scope", ["Single device", "Localized area", "Site-wide"], index=1, key="spoof_mode")
         st.checkbox("Affect mobile (AMR/Truck) only", True, key="spoof_mobile_only")
@@ -319,6 +326,8 @@ def init_state():
     st.session_state.seq_counter = {row.device_id: 0 for _, row in st.session_state.devices.iterrows()}
     st.session_state.spoof_target_id = None
     st.session_state.incident_labels = {}  # incident_id -> {"ack": bool, "false_positive": bool}
+    # Unique UI nonce to avoid duplicate keys across tabs
+    st.session_state.ui_nonce = st.session_state.get("ui_nonce") or str(int(time.time()))
 
 if "devices" not in st.session_state or reset:
     init_state()
@@ -327,6 +336,7 @@ if "devices" not in st.session_state or reset:
 # Realistic metric synthesis
 # =========================
 def update_positions(df):
+    latc, lonc = CFG.site_center
     for i in df.index:
         if df.at[i,"type"] in MOBILE_TYPES:
             h = df.at[i,"heading"] + np.random.normal(0, 0.2)
@@ -334,8 +344,23 @@ def update_positions(df):
             step = df.at[i,"speed_mps"] * np.random.uniform(0.6, 1.4)
             dn, de = step*math.cos(h), step*math.sin(h)
             dlat, dlon = meters_to_latlon_offset(dn, de, df.at[i,"lat"])
-            df.at[i,"lat"] += dlat
-            df.at[i,"lon"] += dlon
+            lat_new = df.at[i,"lat"] + dlat
+            lon_new = df.at[i,"lon"] + dlon
+
+            # Bounce back inside if leaving the site circle
+            dist = haversine_m(lat_new, lon_new, latc, lonc)
+            if dist > CFG.site_radius_m:
+                df.at[i,"heading"] = (h + math.pi/2) % (2*math.pi)
+                vec_n = lat_new - latc
+                vec_e = lon_new - lonc
+                scale = 0.98 * CFG.site_radius_m / max(dist, 1.0)
+                dlat_back = vec_n * scale
+                dlon_back = vec_e * scale
+                df.at[i,"lat"] = latc + dlat_back
+                df.at[i,"lon"] = lonc + dlon_back
+            else:
+                df.at[i,"lat"] = lat_new
+                df.at[i,"lon"] = lon_new
     return df
 
 def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=True, training=False,
@@ -414,27 +439,33 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
     auth_fail = np.random.exponential(0.05)
     crc_err   = int(np.random.poisson(0.2))
 
-    # Wi-Fi breach realism
-    if str(scen).startswith("Wi-Fi Breach") and d_rog <= CFG.breach_radius_m:
-        if row.type in MOBILE_TYPES or np.random.rand()<0.3:
-            rog_rssi = -40 - 18 * math.log10(max(1.0, d_rog)) + np.random.normal(0, 2)
-            rogue_rssi_gap = float(rog_rssi - rssi)
-            if breach_mode == "Evil Twin" or breach_mode is None:
-                deauth_rate      = float(np.clip(deauth_rate + np.random.uniform(0.25, 0.60), 0, 1.0))
-                assoc_churn      = float(np.clip(assoc_churn + np.random.uniform(0.25, 0.50), 0, 1.0))
-                eapol_retry_rate = float(np.clip(eapol_retry_rate + np.random.uniform(0.10, 0.30), 0, 1.0))
-                auth_fail        += np.random.uniform(0.2, 0.6)
-            elif breach_mode == "Rogue Open AP":
-                assoc_churn      = float(np.clip(assoc_churn + np.random.uniform(0.15, 0.35), 0, 1.0))
-                dhcp_fail_rate   = float(np.clip(dhcp_fail_rate + np.random.uniform(0.25, 0.60), 0, 1.0))
-            else:  # Credential hammer
-                eapol_retry_rate = float(np.clip(eapol_retry_rate + np.random.uniform(0.35, 0.70), 0, 1.0))
-                auth_fail        += np.random.uniform(0.4, 0.9)
+    # ---------- Access Breach realism (AP/gNB) ----------
+    if str(scen).startswith("Access Breach"):
+        cellular_mode = st.session_state.get("cellular_mode", False)
+        affect_wifi    = (row.type in {"AMR","Sensor","Gateway"})
+        affect_cellular= (row.type in {"Truck","Gateway"})
+        should_affect = (cellular_mode and affect_cellular) or ((not cellular_mode) and affect_wifi)
+        if should_affect and d_rog <= CFG.breach_radius_m:
+            if row.type in MOBILE_TYPES or np.random.rand()<0.3:
+                rog_rssi = -40 - 18 * math.log10(max(1.0, d_rog)) + np.random.normal(0, 2)
+                rogue_rssi_gap = float(rog_rssi - rssi)
+                mode = st.session_state.get("breach_mode","Evil Twin")
+                if mode == "Evil Twin":
+                    deauth_rate      = float(np.clip(deauth_rate + np.random.uniform(0.25, 0.60), 0, 1.0))
+                    assoc_churn      = float(np.clip(assoc_churn + np.random.uniform(0.25, 0.50), 0, 1.0))
+                    eapol_retry_rate = float(np.clip(eapol_retry_rate + np.random.uniform(0.10, 0.30), 0, 1.0))
+                    auth_fail        += np.random.uniform(0.2, 0.6)
+                elif mode == "Rogue Open AP":
+                    assoc_churn      = float(np.clip(assoc_churn + np.random.uniform(0.15, 0.35), 0, 1.0))
+                    dhcp_fail_rate   = float(np.clip(dhcp_fail_rate + np.random.uniform(0.25, 0.60), 0, 1.0))
+                else:  # Credential hammer
+                    eapol_retry_rate = float(np.clip(eapol_retry_rate + np.random.uniform(0.35, 0.70), 0, 1.0))
+                    auth_fail        += np.random.uniform(0.4, 0.9)
 
     # GPS spoofing realism (training path handled later)
     pos_error = np.random.normal(2.0, 0.7)
 
-    # Data Tamper realism
+    # ---------- Data Tamper realism ----------
     if "seq_counter" not in st.session_state:
         st.session_state.seq_counter = {}
     if row.device_id not in st.session_state.seq_counter:
@@ -569,7 +600,7 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
         scen_code = np.random.choice(["Normal","J","Breach","GPS","Tamper"],
                                      p=[0.55,0.15,0.12,0.10,0.08])
         if   scen_code=="J":     sc="Jamming (localized)";  jm=np.random.choice(["Broadband noise","Reactive","Mgmt (deauth)"]); bm=None
-        elif scen_code=="Breach":sc="Wi-Fi Breach (AP)";    bm=np.random.choice(["Evil Twin","Rogue Open AP","Credential hammer"]); jm=None
+        elif scen_code=="Breach":sc="Access Breach (AP/gNB)"; bm=np.random.choice(["Evil Twin","Rogue Open AP","Credential hammer"]); jm=None
         elif scen_code=="GPS":   sc="GPS Spoofing (subset)"; jm=bm=None
         elif scen_code=="Tamper":sc="Data Tamper (gateway)"; jm=bm=None
         else:                    sc="Normal"; jm=bm=None
@@ -596,7 +627,7 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
                 crypto_enabled=bool(np.random.rand()<0.7),
                 training=True,
                 jam_mode=(jm if "Jamming" in sc else None),
-                breach_mode=(bm if "Wi-Fi Breach" in sc else None)
+                breach_mode=(bm if "Access Breach" in sc else None)
             )
             buf[row.device_id].append(m)
             feats = build_window_features(buf[row.device_id])
@@ -915,7 +946,7 @@ def render_device_inspector_from_incident(inc, topk=8):
 # =========================
 def incident_category(inc):
     s = inc.get("scenario", "")
-    for cat in ["Jamming", "Wi-Fi Breach", "GPS Spoofing", "Data Tamper"]:
+    for cat in ["Jamming", "Access Breach", "GPS Spoofing", "Data Tamper"]:
         if s.startswith(cat): 
             return cat
     return "Other"
@@ -934,8 +965,8 @@ def render_incident_body_for_role(inc, role):
         st.markdown("**What it means**")
         if "Jamming" in inc["scenario"]:
             st.write("Temporary slow or unstable connection nearby.")
-        elif "Wi-Fi Breach" in inc["scenario"]:
-            st.write("Unknown/unsafe Wi-Fi nearby disrupted connectivity.")
+        elif "Access Breach" in inc["scenario"]:
+            st.write("Unknown/unsafe access node nearby disrupted connectivity.")
         elif "GPS Spoofing" in inc["scenario"]:
             st.write("Location may be inaccurate.")
         elif "Data Tamper" in inc["scenario"]:
@@ -944,8 +975,8 @@ def render_incident_body_for_role(inc, role):
         st.markdown("**What to do**")
         if "Jamming" in inc["scenario"]:
             st.write("Move 50–100 m away or retry; the network will change channel.")
-        elif "Wi-Fi Breach" in inc["scenario"]:
-            st.write("Avoid joining unknown SSIDs; protections are active.")
+        elif "Access Breach" in inc["scenario"]:
+            st.write("Avoid joining unknown SSIDs/PLMNs; protections are active.")
         elif "GPS Spoofing" in inc["scenario"]:
             st.write("Use UWB/IMU fallback; limit speed in GNSS-denied mode.")
         else:
@@ -955,7 +986,7 @@ def render_incident_body_for_role(inc, role):
         st.markdown("**Operational signals**")
         if "Jamming" in inc["scenario"]:
             st.write("↑ noise_floor_dbm, ↑ cca_busy_frac, ↑ phy_error_rate, ↑ beacon_miss_rate, ↓ snr")
-        elif "Wi-Fi Breach" in inc["scenario"]:
+        elif "Access Breach" in inc["scenario"]:
             st.write("↑ deauth_rate, ↑ assoc_churn, ↑ eapol_retry_rate / dhcp_fail_rate, rogue_rssi_gap>0")
         elif "Data Tamper" in inc["scenario"]:
             st.write("↑ dup_ratio, ↑ ts_skew_s, ↑ schema_violation_rate, ↑ hmac_fail_rate (if enabled)")
@@ -965,8 +996,8 @@ def render_incident_body_for_role(inc, role):
         st.markdown("**Playbook**")
         if "Jamming" in inc["scenario"]:
             st.write("Channel hop ▸ Spectrum scan ▸ Directional/backup link.")
-        elif "Wi-Fi Breach" in inc["scenario"]:
-            st.write("Quarantine SSID ▸ Rotate credentials ▸ Rogue AP sweep.")
+        elif "Access Breach" in inc["scenario"]:
+            st.write("Quarantine SSID/PLMN ▸ Rotate credentials ▸ Rogue node sweep.")
         elif "Data Tamper" in inc["scenario"]:
             st.write("Reject stale/invalid payloads ▸ Verify signatures ▸ Audit gateway.")
         else:
@@ -1092,8 +1123,12 @@ with tab_overview:
                           get_color=[20,20,20,255], get_size=12, get_alignment_baseline="'top'", get_pixel_offset=[0,10]),
             ]
 
-            # AP marker
-            ap_df = pd.DataFrame([{"lat": st.session_state.ap["lat"], "lon": st.session_state.ap["lon"], "label": "AP"}])
+            # AP / gNB markers based on profile
+            cellular_mode = st.session_state.get("cellular_mode", False)
+            infra_label = "gNB" if cellular_mode else "AP"
+            rogue_label = "Rogue gNB" if cellular_mode else "Rogue AP"
+
+            ap_df = pd.DataFrame([{"lat": st.session_state.ap["lat"], "lon": st.session_state.ap["lon"], "label": infra_label}])
             layers += [
                 pdk.Layer("ScatterplotLayer", data=ap_df, get_position='[lon, lat]',
                           get_fill_color='[30,144,255,240]', get_radius=10),
@@ -1113,7 +1148,7 @@ with tab_overview:
                               stroked=True, get_line_color=[255,0,0,200], get_line_width=2)
                 ]
 
-            # Coverage circles
+            # Coverage circles helper
             def circle_layer(center, radius_m, color):
                 angles = np.linspace(0, 2*np.pi, 60)
                 lat_mean = float(st.session_state.devices.lat.mean())
@@ -1123,6 +1158,7 @@ with tab_overview:
                 ] for a in angles]
                 return pdk.Layer("PathLayer", [{"path": path}], get_path="path", get_color=color, width_scale=4, width_min_pixels=1, opacity=0.25)
 
+            # Scenario overlays
             if scenario.startswith("Jamming"):
                 jam = st.session_state.jammer
                 jam_df = pd.DataFrame([{"lat": jam["lat"], "lon": jam["lon"], "label": "Jammer"}])
@@ -1133,9 +1169,9 @@ with tab_overview:
                               get_color=[255,0,0,255], get_size=14, get_alignment_baseline="'bottom'", get_pixel_offset=[0,-10]),
                     circle_layer(jam, CFG.jam_radius_m, [255,0,0])
                 ]
-            if scenario.startswith("Wi-Fi Breach"):
+            if scenario.startswith("Access Breach"):
                 rog = st.session_state.rogue
-                rog_df = pd.DataFrame([{"lat": rog["lat"], "lon": rog["lon"], "label": "Rogue AP"}])
+                rog_df = pd.DataFrame([{"lat": rog["lat"], "lon": rog["lon"], "label": rogue_label}])
                 layers += [
                     pdk.Layer("ScatterplotLayer", data=rog_df, get_position='[lon, lat]',
                               get_fill_color='[0,255,255,240]', get_radius=10),
@@ -1237,7 +1273,7 @@ with tab_incidents:
             cat_map.setdefault(incident_category(inc), []).append(inc)
 
         # Stable order with counts
-        order = ["Jamming", "Wi-Fi Breach", "GPS Spoofing", "Data Tamper", "Other"]
+        order = ["Jamming", "Access Breach", "GPS Spoofing", "Data Tamper", "Other"]
         cats_present = [c for c in order if c in cat_map] + [c for c in cat_map if c not in order]
         tab_labels = [f"{c} ({len(cat_map[c])})" for c in cats_present]
         tabs = st.tabs(tab_labels + [f"All ({len(all_inc)})"])
@@ -1265,8 +1301,9 @@ with tab_incidents:
         csv = df_inc.drop(columns=["reasons"]).to_csv(index=False).encode("utf-8")
         st.download_button("Download incidents CSV", csv, "incidents.csv", "text/csv", key="dl_incidents_csv")
 
-# ---------- Insights
+# ---------- Insights (unique keys via ui_nonce)
 with tab_insights:
+    nonce = st.session_state.ui_nonce
     g1,g2 = st.columns(2)
     with g1:
         st.markdown("### Global importance (mean |SHAP|)")
@@ -1277,7 +1314,7 @@ with tab_insights:
             imp = pd.DataFrame({"feature": base.columns, "mean_abs_shap": mean_abs}).sort_values("mean_abs_shap", ascending=False).head(18)
             fig = px.bar(imp, x="mean_abs_shap", y="feature", orientation="h",
                          title="Global feature impact — bigger bars = more influence")
-            st.plotly_chart(fig, use_container_width=True, key="global_importance")
+            st.plotly_chart(fig, use_container_width=True, key=f"global_importance_{nonce}")
             if help_mode:
                 st.caption("**Global importance (mean |SHAP|)**: average absolute contribution across many samples—bigger bars = more influential.")
 
@@ -1298,7 +1335,7 @@ with tab_insights:
             fig = px.line(df_rel, x="confidence", y="empirical",
                           title=f"Reliability (Brier {ev.get('brier', np.nan):.3f}) — closer to diagonal is better")
             fig.add_scatter(x=[0,1], y=[0,1], mode="lines", name="perfect")
-            st.plotly_chart(fig, use_container_width=True, key="calibration_curve")
+            st.plotly_chart(fig, use_container_width=True, key=f"calibration_curve_{nonce}")
             if help_mode:
                 st.caption("**Calibration reliability**: predicted vs actual frequencies; closer to diagonal is better. **Brier score** lower is better.")
         else:
@@ -1308,8 +1345,9 @@ with tab_insights:
     st.table(pd.DataFrame({"Feature (base)": list(FEATURE_GLOSSARY.keys()),
                            "Meaning": [FEATURE_GLOSSARY[k] for k in FEATURE_GLOSSARY]}))
 
-# ---------- Governance (EU AI Act transparency)
+# ---------- Governance (EU AI Act transparency) — unique keys via ui_nonce
 with tab_governance:
+    nonce = st.session_state.ui_nonce
     st.subheader("EU AI Act — Transparency & Governance (Demo)")
 
     c1,c2,c3 = st.columns(3)
@@ -1329,36 +1367,36 @@ with tab_governance:
     st.write("- **Source**: synthetic telemetry (no personal data).")
     st.write("- **Signals**: RF/network (e.g., SNR, loss), GNSS error, integrity checks.")
     st.write("- **Retention**: incidents kept in session memory; export below.")
-    col = st.columns(2)
-    with col[0]:
+    c = st.columns(2)
+    with c[0]:
         st.download_button(
             "Download data schema (JSON)",
             data=json.dumps(data_schema_json(), indent=2).encode("utf-8"),
             file_name="data_schema.json",
             mime="application/json",
-            key="dl_schema_json"
+            key=f"gov_dl_schema_json_{nonce}"
         )
-    with col[1]:
+    with c[1]:
         if st.session_state.incidents:
             st.download_button(
                 "Download audit log (incidents.json)",
                 data=json.dumps(audit_log_json(), indent=2).encode("utf-8"),
                 file_name="incidents_audit_log.json",
                 mime="application/json",
-                key="dl_audit_json"
+                key=f"gov_dl_audit_json_{nonce}"
             )
         else:
             st.caption("No incidents yet to export.")
 
     st.markdown("### Model transparency")
     mc = model_card_data()
-    st.json(mc)
+    st.json(mc, expanded=False)
     st.download_button(
         "Download model card (JSON)",
         data=json.dumps(mc, indent=2).encode("utf-8"),
         file_name="model_card.json",
         mime="application/json",
-        key="dl_model_card"
+        key=f"gov_dl_model_card_{nonce}"
     )
 
     st.markdown("### Human oversight")
