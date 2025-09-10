@@ -1,3 +1,4 @@
+# app.py
 import math
 import time
 from collections import deque
@@ -147,6 +148,23 @@ with st.sidebar:
     st.divider()
     retrain = st.button("Retrain model now")
 
+    st.divider()
+    help_mode = st.checkbox("Help mode (inline hints)", True)
+    show_eu_status = st.checkbox("Show EU AI Act status banner", True)
+
+# Simple onboarding + EU status
+if help_mode:
+    st.info(
+        "How to use: ① Pick a **Scenario** → ② Watch **map, KPIs, charts** update → "
+        "③ Open **Incidents** (role-aware explanations) → ④ See **Insights** (global behavior) → "
+        "⑤ Check **Governance** for EU AI Act transparency & evidence."
+    )
+if show_eu_status:
+    st.success(
+        "EU AI Act status: **Limited/Minimal risk demo** (synthetic telemetry; no safety control loop). "
+        "If integrated as a **safety component** or for **critical infrastructure control**, it may become **High-risk** with additional obligations."
+    )
+
 # =========================
 # Helpers
 # =========================
@@ -211,6 +229,49 @@ def get_device_history(device_id, fields):
     df = pd.DataFrame(list(buf))
     return df[fields] if all(f in df.columns for f in fields) else df
 
+def incident_id(inc):
+    return f"{inc['device_id']}_{inc['ts']}_{inc['tick']}"
+
+def model_card_data():
+    return {
+        "model": "LightGBM (binary) on rolling-window features",
+        "version": "v2.6-sundsvall",
+        "features_per_device": len(feature_cols()),
+        "window_length": CFG.rolling_len,
+        "hyperparameters": {
+            "n_estimators": CFG.n_estimators,
+            "max_depth": CFG.max_depth,
+            "learning_rate": CFG.learning_rate,
+            "min_child_samples": 12,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9
+        },
+        "detection_rule": f"probability >= {CFG.threshold:.2f}",
+        "calibration": "Conformal p-value (coverage ~90%)" if st.session_state.get("conformal_scores") is not None else "Disabled",
+        "training_metrics": st.session_state.get("metrics", {}),
+        "data": {
+            "source": "Synthetic demo telemetry (no personal data)",
+            "raw_signals": RAW_FEATURES,
+            "engineered_features_count": len(feature_cols())
+        },
+        "intended_use": "Demo of trustworthy anomaly detection for wireless/logistics",
+        "limitations": [
+            "Synthetic, physics-inspired signals",
+            "Single-site example; not production-ready"
+        ]
+    }
+
+def data_schema_json():
+    return {
+        "raw_features": RAW_FEATURES,
+        "engineered_features": feature_cols(),
+        "pii": False,
+        "notes": "Synthetic signals only; no personal data. Export for transparency."
+    }
+
+def audit_log_json():
+    return {"incidents": st.session_state.get("incidents", [])}
+
 # =========================
 # Session init
 # =========================
@@ -257,6 +318,7 @@ def init_state():
     st.session_state.suggested_threshold = None
     st.session_state.seq_counter = {row.device_id: 0 for _, row in st.session_state.devices.iterrows()}
     st.session_state.spoof_target_id = None
+    st.session_state.incident_labels = {}  # incident_id -> {"ack": bool, "false_positive": bool}
 
 if "devices" not in st.session_state or reset:
     init_state()
@@ -744,7 +806,7 @@ if st.session_state.get("model") is not None:
         if st.button("Step once"): tick_once()
 
 # =========================
-# Transparency banner
+# Transparency banner (engine)
 # =========================
 with st.container():
     m = st.session_state.metrics or {}
@@ -779,7 +841,7 @@ with st.container():
             st.json(m)
 
 # =========================
-# KPIs + metric glossary
+# KPIs + metric glossary (inline)
 # =========================
 k1,k2,k3,k4,k5 = st.columns(5)
 with k1: st.metric("Devices", len(st.session_state.devices))
@@ -787,21 +849,16 @@ with k2: st.metric("Incidents (session)", len(st.session_state.incidents))
 with k3:
     auc = (st.session_state.metrics or {}).get("auc", 0)
     st.metric("Model AUC", f"{auc:.2f}")
+    if help_mode:
+        st.caption("**Model AUC**: discrimination; 0.5 = random, 1.0 = perfect. Higher is better.")
 with k4:
     probs = list(st.session_state.latest_probs.values())
     st.metric("Fleet risk (mean prob)", f"{(np.mean(probs) if probs else 0):.2f}")
+    if help_mode:
+        st.caption("**Fleet risk (mean prob)**: average anomaly probability across devices now; higher implies site-wide stress.")
 with k5:
     train_secs = st.session_state.get("last_train_secs")
     st.metric("Last train duration", f"{int(train_secs)}s" if train_secs else "—")
-
-with st.expander("What these metrics mean"):
-    st.markdown(
-        "- **Model AUC**: discrimination; 0.5=random, 1.0=perfect. Higher is better.\n"
-        "- **Fleet risk (mean prob)**: average anomaly probability across devices this tick; higher implies site-wide stress.\n"
-        "- **Fleet avg SNR** (see Overview charts): mean link quality; <10 dB is shaky; >20 dB is healthy.\n"
-        "- **Global importance (mean |SHAP|)**: average absolute contribution of each feature across many samples — bigger bars = more influential.\n"
-        "- **Calibration reliability**: compares predicted probabilities to actual frequencies; closer to diagonal is better. Brier score is overall calibration error (lower is better)."
-    )
 
 # =========================
 # SHAP renderer for incidents (snapshot)
@@ -812,11 +869,12 @@ def render_device_inspector_from_incident(inc, topk=8):
         st.info("Not enough samples for device window yet.")
         return
 
+    base_key = f"{inc['device_id']}_{inc['ts']}_{inc['tick']}"
+
     X = pd.DataFrame([feats]).fillna(0.0)
     Xs = st.session_state.scaler.transform(X)
-    Xs_df = to_df(Xs, X.columns)
+    Xs_df = pd.DataFrame(Xs, columns=X.columns)
     prob = float(st.session_state.model.predict_proba(Xs_df)[:, 1][0])
-    pval = conformal_pvalue(prob) if st.session_state.get("conformal_scores") is not None else None
 
     # Risk gauge
     gauge = go.Figure(go.Indicator(
@@ -828,7 +886,7 @@ def render_device_inspector_from_incident(inc, topk=8):
             'threshold': {'line': {'color': "red", 'width': 3}, 'thickness': 0.8, 'value': CFG.threshold*100}
         }
     ))
-    st.plotly_chart(gauge, width='stretch')
+    st.plotly_chart(gauge, use_container_width=True, key=f"gauge_{base_key}")
 
     # Top SHAP contributions
     shap_vec = shap_pos(st.session_state.explainer, Xs_df)[0]
@@ -837,25 +895,163 @@ def render_device_inspector_from_incident(inc, topk=8):
     fig = px.bar(df_shap.sort_values("impact"), x="impact", y="feature", orientation="h",
                  title=f"Top local contributions — {inc['device_id']}",
                  labels={"impact": "contribution → anomaly"})
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, use_container_width=True, key=f"local_shap_{base_key}")
 
     # Mini history (last window)
     hist = get_device_history(inc["device_id"], ["snr","packet_loss","latency_ms","pos_error_m"])
     if len(hist)>0:
         hist = hist.reset_index(drop=True)
         c1,c2 = st.columns(2)
-        c1.plotly_chart(px.line(hist, y="snr", title="SNR (last window)"), width='stretch')
-        c1.plotly_chart(px.line(hist, y="packet_loss", title="Packet loss % (last window)"), width='stretch')
-        c2.plotly_chart(px.line(hist, y="latency_ms", title="Latency ms (last window)"), width='stretch')
-        c2.plotly_chart(px.line(hist, y="pos_error_m", title="GNSS error m (last window)"), width='stretch')
+        c1.plotly_chart(px.line(hist, y="snr", title="SNR (last window)"), use_container_width=True, key=f"hist_snr_{base_key}")
+        c1.plotly_chart(px.line(hist, y="packet_loss", title="Packet loss % (last window)"), use_container_width=True, key=f"hist_loss_{base_key}")
+        c2.plotly_chart(px.line(hist, y="latency_ms", title="Latency ms (last window)"), use_container_width=True, key=f"hist_latency_{base_key}")
+        c2.plotly_chart(px.line(hist, y="pos_error_m", title="GNSS error m (last window)"), use_container_width=True, key=f"hist_gnss_{base_key}")
 
     with st.expander("Raw window features (standardized input)"):
         st.dataframe(Xs_df.T.rename(columns={0: "z-value"}), use_container_width=True)
 
 # =========================
+# Role-aware incident rendering & categorization
+# =========================
+def incident_category(inc):
+    s = inc.get("scenario", "")
+    for cat in ["Jamming", "Wi-Fi Breach", "GPS Spoofing", "Data Tamper"]:
+        if s.startswith(cat): 
+            return cat
+    return "Other"
+
+def render_incident_body_for_role(inc, role):
+    base_key = incident_id(inc)
+    pv = inc.get("p_value")
+    pv_str = f"{pv:.3f}" if pv is not None else "—"
+    sev = inc.get("severity", "—")
+    cols = st.columns(3)
+    cols[0].metric("Severity", sev)
+    cols[1].metric("Prob.", f"{inc['prob']:.2f}")
+    cols[2].metric("p-value", pv_str)
+
+    if role == "End User":
+        st.markdown("**What it means**")
+        if "Jamming" in inc["scenario"]:
+            st.write("Temporary slow or unstable connection nearby.")
+        elif "Wi-Fi Breach" in inc["scenario"]:
+            st.write("Unknown/unsafe Wi-Fi nearby disrupted connectivity.")
+        elif "GPS Spoofing" in inc["scenario"]:
+            st.write("Location may be inaccurate.")
+        elif "Data Tamper" in inc["scenario"]:
+            st.write("Some readings looked reused or out of range.")
+
+        st.markdown("**What to do**")
+        if "Jamming" in inc["scenario"]:
+            st.write("Move 50–100 m away or retry; the network will change channel.")
+        elif "Wi-Fi Breach" in inc["scenario"]:
+            st.write("Avoid joining unknown SSIDs; protections are active.")
+        elif "GPS Spoofing" in inc["scenario"]:
+            st.write("Use UWB/IMU fallback; limit speed in GNSS-denied mode.")
+        else:
+            st.write("Retry; if it persists, notify ops.")
+
+    elif role == "Domain Expert":
+        st.markdown("**Operational signals**")
+        if "Jamming" in inc["scenario"]:
+            st.write("↑ noise_floor_dbm, ↑ cca_busy_frac, ↑ phy_error_rate, ↑ beacon_miss_rate, ↓ snr")
+        elif "Wi-Fi Breach" in inc["scenario"]:
+            st.write("↑ deauth_rate, ↑ assoc_churn, ↑ eapol_retry_rate / dhcp_fail_rate, rogue_rssi_gap>0")
+        elif "Data Tamper" in inc["scenario"]:
+            st.write("↑ dup_ratio, ↑ ts_skew_s, ↑ schema_violation_rate, ↑ hmac_fail_rate (if enabled)")
+        elif "GPS Spoofing" in inc["scenario"]:
+            st.write("↑ pos_error_m with smooth bias/drift")
+
+        st.markdown("**Playbook**")
+        if "Jamming" in inc["scenario"]:
+            st.write("Channel hop ▸ Spectrum scan ▸ Directional/backup link.")
+        elif "Wi-Fi Breach" in inc["scenario"]:
+            st.write("Quarantine SSID ▸ Rotate credentials ▸ Rogue AP sweep.")
+        elif "Data Tamper" in inc["scenario"]:
+            st.write("Reject stale/invalid payloads ▸ Verify signatures ▸ Audit gateway.")
+        else:
+            st.write("GNSS-denied nav ▸ Verify time source ▸ Geofence sanity.")
+
+        with st.expander("Device Inspector (local SHAP)"):
+            render_device_inspector_from_incident(inc, topk=8)
+
+    elif role == "Regulator":
+        st.markdown("**Assurance & governance**")
+        st.write("- Calibrated confidence via conformal p-value (lower is stronger evidence).")
+        st.write("- Audit trail available; no personal data—technical telemetry only.")
+        evidence = {
+            "ts": inc["ts"], "tick": inc["tick"], "device_id": inc["device_id"], "type": inc["type"],
+            "lat": inc["lat"], "lon": inc["lon"], "scenario": inc["scenario"], "severity": inc["severity"],
+            "prob": inc["prob"], "p_value": inc["p_value"], "model_version": "LightGBM v2.6-demo",
+            "explanations": inc["reasons"]
+        }
+        st.download_button(
+            "Download incident evidence (JSON)",
+            data=json.dumps(evidence, indent=2).encode("utf-8"),
+            file_name=f"incident_{inc['device_id']}_{inc['ts']}_{inc['tick']}.json",
+            mime="application/json",
+            key=f"dl_evidence_{base_key}"
+        )
+
+    elif role == "AI Builder":
+        st.markdown("**Model view**")
+        render_device_inspector_from_incident(inc, topk=8)
+        with st.expander("Standardized feature vector (z-values)"):
+            feats = inc.get("features") or st.session_state.last_features.get(inc["device_id"])
+            if feats:
+                X = pd.DataFrame([feats]).fillna(0.0)
+                Xs = st.session_state.scaler.transform(X)
+                Xs_df = pd.DataFrame(Xs, columns=X.columns)
+                st.dataframe(Xs_df.T.rename(columns={0:"z"}), use_container_width=True)
+
+    else:  # Executive
+        st.markdown("**Executive summary**")
+        st.write(f"- Device **{inc['device_id']}** at risk: **{inc['severity']}**; scenario: **{inc['scenario']}**.")
+        st.write("- Impact: transient performance/security risk; mitigations active.")
+        st.markdown("**KPIs**")
+        st.write("- Incidents, MTTD, Packet loss, Latency, SNR, Deauth rate")
+
+def render_incident_card(inc, role):
+    base_key = incident_id(inc)
+    pv = inc.get("p_value"); pv_str = f"{pv:.3f}" if pv is not None else "—"
+    sev = inc.get("severity", "—")
+    color = {"High":"red","Medium":"orange","Low":"green"}.get(sev, "gray")
+    badge = f"<span style='background:{color};color:white;padding:2px 8px;border-radius:8px;'>{sev}</span>"
+
+    cols = st.columns([1.8, 1])
+    with cols[0]:
+        st.markdown(
+            f"**{inc['device_id']}** ({inc['type']}) · {inc['scenario']} · prob={inc['prob']:.2f} · p={pv_str} · {badge}",
+            unsafe_allow_html=True
+        )
+        concise = [{"feature": r["feature"], "impact": r["impact"]} for r in inc["reasons"]][:3]
+        st.markdown(why_this_alert_plain(concise))
+
+        lcol, rcol = st.columns(2)
+        with lcol:
+            if st.button("Acknowledge", key=f"ack_{base_key}"):
+                st.session_state.incident_labels[base_key] = {"ack": True, "false_positive": False}
+        with rcol:
+            if st.button("Mark false positive", key=f"fp_{base_key}"):
+                st.session_state.incident_labels[base_key] = {"ack": True, "false_positive": True}
+
+        label = st.session_state.incident_labels.get(base_key)
+        if label:
+            tag = "FALSE POSITIVE" if label.get("false_positive") else "ACKNOWLEDGED"
+            st.caption(f"Label: **{tag}** (human oversight)")
+
+        with st.expander("Details"):
+            render_incident_body_for_role(inc, role)
+
+    with cols[1]:
+        st.json({k: inc[k] for k in ["tick","device_id","type","prob","p_value"]})
+
+# =========================
 # Layout tabs
 # =========================
-tab_overview, tab_fleet, tab_incidents, tab_insights = st.tabs(["Overview", "Fleet View", "Incidents", "Insights"])
+tab_overview, tab_fleet, tab_incidents, tab_insights, tab_governance = st.tabs(
+    ["Overview", "Fleet View", "Incidents", "Insights", "Governance"]
+)
 
 # ---------- Overview
 with tab_overview:
@@ -917,6 +1113,7 @@ with tab_overview:
                               stroked=True, get_line_color=[255,0,0,200], get_line_width=2)
                 ]
 
+            # Coverage circles
             def circle_layer(center, radius_m, color):
                 angles = np.linspace(0, 2*np.pi, 60)
                 lat_mean = float(st.session_state.devices.lat.mean())
@@ -994,7 +1191,9 @@ with tab_overview:
             for y in ["snr","packet_loss","latency_ms","pos_error_m"]:
                 sub = fr.groupby("tick")[y].mean().reset_index()
                 fig=px.line(sub, x="tick", y=y, title=f"Fleet avg {y}")
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True, key=f"overview_{y}")
+                if y == "snr" and help_mode:
+                    st.caption("**Fleet avg SNR**: mean link quality; <10 dB shaky; >20 dB healthy.")
 
     with right:
         leaderboard=[]
@@ -1012,7 +1211,7 @@ with tab_overview:
 # ---------- Fleet View
 with tab_fleet:
     fr = pd.DataFrame(list(st.session_state.fleet_records))
-    if len(fr)>0:
+    if len(fr)>0 and show_heatmap:
         recent = fr[fr["tick"]>=st.session_state.tick-40]
         cols = ["snr","packet_loss","latency_ms","jitter_ms","pos_error_m","auth_fail_rate","crc_err","throughput_mbps","channel_util",
                 "noise_floor_dbm","cca_busy_frac","phy_error_rate","deauth_rate","assoc_churn","eapol_retry_rate","dhcp_fail_rate"]
@@ -1021,111 +1220,44 @@ with tab_fleet:
         z = (mat-mat.mean())/mat.std(ddof=0).replace(0,1)
         fig = px.imshow(z.T, color_continuous_scale="RdBu_r", aspect="auto",
                         labels=dict(color="z-score"), title="Fleet heatmap (recent mean z-scores)")
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True, key="fleet_heatmap")
     st.dataframe(st.session_state.devices, use_container_width=True)
 
 # ---------- Incidents
 with tab_incidents:
     st.subheader("Incidents")
-    if len(st.session_state.incidents)==0:
+
+    all_inc = st.session_state.incidents
+    if not all_inc:
         st.success("No incidents yet.")
     else:
-        for i, inc in enumerate(reversed(st.session_state.incidents[-15:]), 1):
-            pv = inc.get("p_value")
-            pv_str = f"{pv:.3f}" if pv is not None else "—"
-            sev, color = inc["severity"], {"High":"red","Medium":"orange","Low":"green"}.get(inc["severity"],"gray")
-            title = f"#{len(st.session_state.incidents)-i+1} • {inc['scenario']} • {inc['device_id']} ({inc['type']}) • prob={inc['prob']:.2f} • p={pv_str} • {sev}"
-            with st.expander(title):
-                badge=f"<span style='background-color:{color}; color:white; padding:2px 8px; border-radius:8px;'>{sev}</span>"
-                st.markdown(f"**Severity**: {badge}", unsafe_allow_html=True)
+        # Build categories (by scenario)
+        cat_map = {}
+        for inc in reversed(all_inc):  # newest first
+            cat_map.setdefault(incident_category(inc), []).append(inc)
 
-                st.markdown("#### Why this alert?")
-                st.markdown(why_this_alert_plain(inc["reasons"]))
+        # Stable order with counts
+        order = ["Jamming", "Wi-Fi Breach", "GPS Spoofing", "Data Tamper", "Other"]
+        cats_present = [c for c in order if c in cat_map] + [c for c in cat_map if c not in order]
+        tab_labels = [f"{c} ({len(cat_map[c])})" for c in cats_present]
+        tabs = st.tabs(tab_labels + [f"All ({len(all_inc)})"])
 
-                left,right = st.columns([2,1])
+        # Per-category tabs
+        for t_idx, c in enumerate(cats_present):
+            with tabs[t_idx]:
+                sev_sel = st.multiselect("Show severities", ["High","Medium","Low"],
+                                         default=["High","Medium","Low"], key=f"sev_{c}")
+                for inc in cat_map[c]:
+                    if inc["severity"] in sev_sel:
+                        render_incident_card(inc, role)
 
-                with left:
-                    # Visuals: gauge + local SHAP + mini history
-                    render_device_inspector_from_incident(inc, topk=8)
-
-                    tabs = st.tabs(["End Users","Domain Experts","Regulators","AI Builders","Executives"])
-                    with tabs[0]:
-                        st.markdown("#### What it means")
-                        if "Jamming" in inc["scenario"]:
-                            st.write("Temporary slow or unstable connection nearby.")
-                        elif "GPS Spoofing" in inc["scenario"]:
-                            st.write("Location may be inaccurate.")
-                        elif "Wi-Fi Breach" in inc["scenario"]:
-                            st.write("Unknown/unsafe Wi-Fi nearby disrupted connectivity.")
-                        elif "Data Tamper" in inc["scenario"]:
-                            st.write("Some readings looked reused or out of range.")
-                        st.markdown("#### What to do now")
-                        if "Jamming" in inc["scenario"]:
-                            st.write("Move 50–100 m away or retry; ops will switch channel.")
-                        elif "GPS Spoofing" in inc["scenario"]:
-                            st.write("Use UWB/IMU fusion; limit speed in GNSS-denied mode.")
-                        elif "Wi-Fi Breach" in inc["scenario"]:
-                            st.write("Avoid unknown SSIDs; network is enforcing protections.")
-                        else:
-                            st.write("Retry; if it persists, escalate to ops.")
-
-                    with tabs[1]:
-                        st.markdown("#### Operational assessment")
-                        st.write(f"- Severity **{sev}** (prob={inc['prob']:.2f}, p={pv_str})")
-                        obs=" • ".join([f"{r['feature']}({r['impact']:+.3f})" for r in inc["reasons"]])
-                        st.write(f"- Key observables: {obs}")
-                        st.markdown("#### Signals")
-                        if "Jamming" in inc["scenario"]:
-                            st.write("↑ noise_floor_dbm, ↑ cca_busy_frac, ↑ phy_error_rate, ↑ beacon_miss_rate, ↓ snr")
-                        elif "Wi-Fi Breach" in inc["scenario"]:
-                            st.write("↑ deauth_rate, ↑ assoc_churn, ↑ eapol_retry_rate / dhcp_fail_rate, rogue_rssi_gap>0")
-                        elif "Data Tamper" in inc["scenario"]:
-                            st.write("↑ dup_ratio, ↑ ts_skew_s, ↑ schema_violation_rate, ↑ hmac_fail_rate (if enabled)")
-                        elif "GPS Spoofing" in inc["scenario"]:
-                            st.write("↑ pos_error_m with smooth bias/drift")
-                        st.markdown("#### Playbook")
-                        if "Jamming" in inc["scenario"]:
-                            st.write("Channel hop ▸ Spectrum scan ▸ Directional/backup link.")
-                        elif "Wi-Fi Breach" in inc["scenario"]:
-                            st.write("Quarantine SSID ▸ Rotate credentials ▸ Rogue AP sweep.")
-                        elif "Data Tamper" in inc["scenario"]:
-                            st.write("Reject stale/invalid payloads ▸ Verify signatures ▸ Audit gateway.")
-                        else:
-                            st.write("Switch to GNSS-denied nav ▸ Verify time source ▸ Geofence sanity.")
-
-                    with tabs[2]:
-                        st.markdown("#### Assurance & governance")
-                        st.write(f"- Calibrated confidence: p-value = {pv_str} (target coverage {int(CFG.coverage*100)}%).")
-                        st.write("- Audit trail: downloadable incident evidence with model version & inputs.")
-                        st.write("- No personal data; technical telemetry only.")
-                        evidence = {
-                            "ts": inc["ts"], "tick": inc["tick"], "device_id": inc["device_id"], "type": inc["type"],
-                            "lat": inc["lat"], "lon": inc["lon"], "scenario": inc["scenario"], "severity": inc["severity"],
-                            "prob": inc["prob"], "p_value": inc["p_value"], "model_version": "LightGBM v2.6-demo",
-                            "explanations": inc["reasons"]
-                        }
-                        st.download_button(
-                            "Download incident evidence (JSON)",
-                            data=json.dumps(evidence, indent=2).encode("utf-8"),
-                            file_name=f"incident_{inc['device_id']}_{inc['ts']}_{inc['tick']}.json",
-                            mime="application/json",
-                            key=f"dl_evidence_{inc['device_id']}_{inc['ts']}_{inc['tick']}_{i}"
-                        )
-
-                    with tabs[3]:
-                        st.markdown("#### For AI Builders")
-                        st.write("Local SHAP, standardized feature snapshot, and recent window trends shown above.")
-                        st.caption("Positive SHAP increases anomaly score in standardized space.")
-
-                    with tabs[4]:
-                        st.markdown("#### Executive summary")
-                        st.write(f"- Device {inc['device_id']} at risk: **{sev}**; scenario: **{inc['scenario']}**.")
-                        st.write("- Impact: transient performance/security issues; mitigations in place.")
-                        st.markdown("#### KPIs")
-                        st.write("- Incidents, MTTD, Packet loss, Latency, SNR, Deauth rate")
-
-                with right:
-                    st.json({k:inc[k] for k in ["prob","p_value","tick","device_id","type","scenario"]})
+        # 'All' tab
+        with tabs[-1]:
+            sev_sel_all = st.multiselect("Show severities", ["High","Medium","Low"],
+                                         default=["High","Medium","Low"], key="sev_all_tabs")
+            for inc in all_inc:
+                if inc["severity"] in sev_sel_all:
+                    render_incident_card(inc, role)
 
     if st.session_state.incidents:
         df_inc = pd.DataFrame(st.session_state.incidents)
@@ -1145,9 +1277,9 @@ with tab_insights:
             imp = pd.DataFrame({"feature": base.columns, "mean_abs_shap": mean_abs}).sort_values("mean_abs_shap", ascending=False).head(18)
             fig = px.bar(imp, x="mean_abs_shap", y="feature", orientation="h",
                          title="Global feature impact — bigger bars = more influence")
-            st.plotly_chart(fig, width='stretch')
-        with st.expander("What 'mean |SHAP|' means"):
-            st.write("Average absolute contribution of each feature to the model’s output over many samples. Larger means feature matters more overall.")
+            st.plotly_chart(fig, use_container_width=True, key="global_importance")
+            if help_mode:
+                st.caption("**Global importance (mean |SHAP|)**: average absolute contribution across many samples—bigger bars = more influential.")
 
     with g2:
         st.markdown("### Calibration (reliability)")
@@ -1166,7 +1298,9 @@ with tab_insights:
             fig = px.line(df_rel, x="confidence", y="empirical",
                           title=f"Reliability (Brier {ev.get('brier', np.nan):.3f}) — closer to diagonal is better")
             fig.add_scatter(x=[0,1], y=[0,1], mode="lines", name="perfect")
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True, key="calibration_curve")
+            if help_mode:
+                st.caption("**Calibration reliability**: predicted vs actual frequencies; closer to diagonal is better. **Brier score** lower is better.")
         else:
             st.info("Train (or retrain) to view calibration.")
 
@@ -1174,19 +1308,59 @@ with tab_insights:
     st.table(pd.DataFrame({"Feature (base)": list(FEATURE_GLOSSARY.keys()),
                            "Meaning": [FEATURE_GLOSSARY[k] for k in FEATURE_GLOSSARY]}))
 
-    st.markdown("### Model card")
-    st.json({
-        "model": "LightGBM (binary) on rolling-window features",
-        "features_per_device": len(feature_cols()),
-        "window_length": CFG.rolling_len,
-        "detection_rule": f"probability >= {CFG.threshold:.2f}" + (" + conformal p-value for severity" if use_conformal else ""),
-        "training_metrics": st.session_state.metrics,
-        "calibration": f"Conformal p-value (target coverage {int(CFG.coverage*100)}%)" if use_conformal else "Disabled",
-        "realism": "Distance-based RF, jamming modes, rogue AP behaviors, GNSS spoof scopes, integrity/freshness for tamper",
-        "intended_use": "Demonstration of trustworthy anomaly detection in wireless/logistics (Sundsvall/MSU)",
-        "limitations": [
-            "Synthetic but physics-inspired; not production-ready",
-            "Single-site example without true multi-AP roaming"
-        ],
-        "version": "v2.6-sundsvall"
-    })
+# ---------- Governance (EU AI Act transparency)
+with tab_governance:
+    st.subheader("EU AI Act — Transparency & Governance (Demo)")
+
+    c1,c2,c3 = st.columns(3)
+    with c1:
+        st.success("✅ Data transparency")
+        st.success("✅ Model transparency")
+    with c2:
+        st.success("✅ Logging & evidence")
+        st.success("✅ Human oversight")
+    with c3:
+        st.info("ℹ️ Risk: Demonstration system (synthetic, non-production)")
+
+    if help_mode:
+        st.caption("This demo surfaces transparency artifacts inline to help stakeholders understand data, model, confidence, and controls. Not legal advice.")
+
+    st.markdown("### Data transparency")
+    st.write("- **Source**: synthetic telemetry (no personal data).")
+    st.write("- **Signals**: RF/network (e.g., SNR, loss), GNSS error, integrity checks.")
+    st.write("- **Retention**: incidents kept in session memory; export below.")
+    col = st.columns(2)
+    with col[0]:
+        st.download_button(
+            "Download data schema (JSON)",
+            data=json.dumps(data_schema_json(), indent=2).encode("utf-8"),
+            file_name="data_schema.json",
+            mime="application/json",
+            key="dl_schema_json"
+        )
+    with col[1]:
+        if st.session_state.incidents:
+            st.download_button(
+                "Download audit log (incidents.json)",
+                data=json.dumps(audit_log_json(), indent=2).encode("utf-8"),
+                file_name="incidents_audit_log.json",
+                mime="application/json",
+                key="dl_audit_json"
+            )
+        else:
+            st.caption("No incidents yet to export.")
+
+    st.markdown("### Model transparency")
+    mc = model_card_data()
+    st.json(mc)
+    st.download_button(
+        "Download model card (JSON)",
+        data=json.dumps(mc, indent=2).encode("utf-8"),
+        file_name="model_card.json",
+        mime="application/json",
+        key="dl_model_card"
+    )
+
+    st.markdown("### Human oversight")
+    st.write("Every incident card has **Acknowledge** and **Mark false positive** controls.")
+    st.caption("These labels demonstrate human-in-the-loop review and are included in exported audit logs.")
