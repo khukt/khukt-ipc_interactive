@@ -622,7 +622,7 @@ with tab_overview:
             tooltip = {"html": "<b>{device_id}</b> • {type}<br/>Risk: {risk}<br/>SNR: {snr} dB<br/>Loss: {packet_loss}%",
                        "style": {"backgroundColor": "rgba(255,255,255,0.95)", "color": "#111"}}
             st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view_state, map_style=None, tooltip=tooltip),
-                            width='stretch')
+                            use_container_width=True)
 
             # Legend
             st.markdown(
