@@ -1,276 +1,412 @@
-import streamlit as st
+import time
+from collections import deque
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import streamlit as st
+import altair as alt
 
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
 
-# Optional imports that might fail on some environments; guard gracefully
-try:
-    import shap
-    SHAP_AVAILABLE = True
-except Exception:
-    SHAP_AVAILABLE = False
+# -----------------------------
+# App config
+# -----------------------------
+st.set_page_config(page_title="TRUST AI — Fast Wireless Threat Demo", layout="wide")
+st.title("TRUST AI — Wireless Threat Detection (Ultra-Light Demo)")
+st.caption("Fast load • Logistic Regression + Interactions • Coefficient-based XAI • Conformal p-value")
 
-try:
-    from lime.lime_tabular import LimeTabularExplainer
-    LIME_AVAILABLE = True
-except Exception:
-    LIME_AVAILABLE = False
+# -----------------------------
+# Controls (sidebar)
+# -----------------------------
+with st.sidebar:
+    st.header("Demo Controls")
+    scenario = st.selectbox(
+        "Scenario", ["Normal", "Jamming", "GPS Spoofing", "Wi-Fi Breach", "Data Tamper"], index=0
+    )
+    speed = st.slider("Playback speed (x)", 1, 20, 5)
+    auto = st.checkbox("Auto stream", value=True)
+    reset = st.button("Reset stream")
 
-st.set_page_config(page_title="Trustworthy AI Demos (6G/IIoT)", layout="wide")
+    st.divider()
+    st.subheader("Model / Alerts")
+    thr = st.slider("Incident threshold (prob.)", 0.50, 0.95, 0.75, 0.01)
+    use_conformal = st.checkbox("Show conformal p-value (calibrated risk)", True)
 
-st.title("Trustworthy AI Demos — 6G / IIoT")
-st.caption("Three lightweight, self-contained demos for Explainable AI, tailored to networking & industrial IoT.")
+# -----------------------------
+# Globals
+# -----------------------------
+RAW_FEATURES = [
+    "rssi", "snr", "packet_loss", "latency_ms", "jitter_ms",
+    "pos_error_m", "auth_fail_rate", "crc_err", "throughput_mbps", "channel_util"
+]
+ROLL = 5                          # rolling window seconds for features
+BUF_MAX = 600                     # max points kept for charts
+SEED = 7
+np.random.seed(SEED)
 
-demo = st.sidebar.radio(
-    "Choose a demo",
-    ["1) Resource Allocation (TreeSHAP)",
-     "2) Network Anomaly Detection (LIME)",
-     "3) Predictive Maintenance (Counterfactuals)"]
-)
+def init_state():
+    st.session_state.raw = deque(maxlen=BUF_MAX)
+    st.session_state.roll = deque(maxlen=ROLL)
+    st.session_state.incidents = []
+    st.session_state.step = 0
+    st.session_state.trigger = None
 
-# --------- Utility: synthetic data generators --------- #
-rng = np.random.default_rng(42)
+    # Model containers
+    st.session_state.scaler = None
+    st.session_state.poly = None
+    st.session_state.model = None
+    st.session_state.feat_names = None
+    st.session_state.cal_nc = None
+    st.session_state.metrics = {}
+    st.session_state.trained = False
 
-def gen_resource_alloc(n=800, seed=0):
-    r = np.random.default_rng(seed)
-    snr = r.normal(loc=10, scale=5, size=n)          # dB
-    latency_req = r.uniform(1, 100, size=n)          # ms
-    energy = r.uniform(0.1, 1.0, size=n)             # normalized
-    mobility = r.uniform(0, 50, size=n)              # km/h
-    device_priority = r.integers(0, 3, size=n)       # {0,1,2}
-    # Label rule: allocate if (SNR high) & (latency strict) & (priority high) OR (energy high & low mobility)
-    score = 0.35*(snr>12) + 0.25*(latency_req<20) + 0.25*(device_priority==2) + 0.15*((energy>0.6)&(mobility<10))
-    y = (score + r.normal(0, 0.05, n) > 0.5).astype(int)
-    X = pd.DataFrame({
-        "snr_db": snr,
-        "latency_req_ms": latency_req,
-        "energy_norm": energy,
-        "mobility_kmh": mobility,
-        "device_priority": device_priority
-    })
+    st.session_state.last_pred = None
+    st.session_state.baseline = None  # for quick drift-ish comparisons
+
+if "raw" not in st.session_state or reset:
+    init_state()
+
+# -----------------------------
+# Synthetic data
+# -----------------------------
+def gen_normal_row():
+    return {
+        "rssi": np.random.normal(-65, 3),
+        "snr": np.random.normal(25, 2),
+        "packet_loss": max(0, np.random.normal(0.5, 0.3)),
+        "latency_ms": max(5, np.random.normal(30, 8)),
+        "jitter_ms": max(0.3, np.random.normal(2, 0.7)),
+        "pos_error_m": max(0.3, np.random.normal(2.5, 0.7)),
+        "auth_fail_rate": max(0, np.random.normal(0.2, 0.2)),
+        "crc_err": max(0, np.random.poisson(0.2)),
+        "throughput_mbps": max(2, np.random.normal(50, 8)),
+        "channel_util": np.clip(np.random.normal(35, 8), 0, 100),
+    }
+
+def inject(row, scenario, t_since):
+    r = row.copy()
+    if scenario == "Jamming":
+        k = min(1.0, t_since/4)
+        r["snr"] -= 8*k + np.random.uniform(0,2)
+        r["packet_loss"] += 7*k + np.random.uniform(0,2)
+        r["latency_ms"] += 30*k + np.random.uniform(0,8)
+        r["jitter_ms"] += 4*k + np.random.uniform(0,1.5)
+        r["channel_util"] += 10*k
+    elif scenario == "GPS Spoofing":
+        k = min(1.0, t_since/4)
+        r["pos_error_m"] += 25*k + np.random.uniform(0,8)
+        r["jitter_ms"] += 1.5*k
+        r["latency_ms"] += 8*k
+    elif scenario == "Wi-Fi Breach":
+        k = min(1.0, t_since/4)
+        r["auth_fail_rate"] += 6*k + np.random.uniform(0,2)
+        r["channel_util"] += 18*k + np.random.uniform(0,4)
+        r["crc_err"] += np.random.poisson(1 + 2*k)
+    elif scenario == "Data Tamper":
+        if np.random.rand() < 0.7:
+            r["throughput_mbps"] *= np.random.uniform(1.5, 2.0)
+        r["crc_err"] += np.random.poisson(2)
+        r["packet_loss"] += np.random.uniform(3, 8)
+    return r
+
+# -----------------------------
+# Feature engineering (fast)
+# -----------------------------
+def build_features(roll_buf):
+    if not roll_buf:
+        return {}
+    df = pd.DataFrame(list(roll_buf))
+    feats = {}
+    for f in RAW_FEATURES:
+        s = df[f]
+        feats[f"{f}_mean"] = float(s.mean())
+        feats[f"{f}_std"] = float(s.std(ddof=0)) if len(s) > 1 else 0.0
+        feats[f"{f}_last"] = float(s.iloc[-1])
+        if len(s) >= 2:
+            feats[f"{f}_jump"] = float(s.iloc[-1] - s.iloc[-2])
+        else:
+            feats[f"{f}_jump"] = 0.0
+    return feats
+
+def feat_cols():
+    cols = []
+    for f in RAW_FEATURES:
+        cols += [f"{f}_mean", f"{f}_std", f"{f}_last", f"{f}_jump"]
+    return cols
+
+# -----------------------------
+# Training (tiny, fast)
+# -----------------------------
+def synth(seconds, scenario="Normal", label=0):
+    rows = []
+    for t in range(seconds):
+        r = gen_normal_row()
+        if scenario != "Normal":
+            r = inject(r, scenario, t_since=max(0, t-1))
+        rows.append(r)
+    df = pd.DataFrame(rows)
+    df["label"] = label
+    return df
+
+def make_dataset():
+    # Keep very small for fast boot
+    Nn = 90
+    Na = 30
+    df = pd.concat([
+        synth(Nn, "Normal", 0),
+        synth(Na, "Jamming", 1),
+        synth(Na, "GPS Spoofing", 1),
+        synth(Na, "Wi-Fi Breach", 1),
+        synth(Na, "Data Tamper", 1),
+    ], ignore_index=True)
+
+    roll = deque(maxlen=ROLL)
+    feats_all, y = [], []
+    for _, row in df.iterrows():
+        raw = {k: row[k] for k in RAW_FEATURES}
+        roll.append(raw)
+        feats_all.append(build_features(roll))
+        y.append(int(row["label"]))
+    X = pd.DataFrame(feats_all).fillna(0.0)
+    y = np.array(y)
     return X, y
 
-def gen_anomaly(n=1000, seed=1):
-    r = np.random.default_rng(seed)
-    mean_latency = r.normal(30, 10, size=n)          # ms
-    jitter = r.exponential(5, size=n)                # ms
-    throughput = r.normal(100, 30, size=n)           # Mbps
-    pkt_drop = r.uniform(0, 5, size=n)               # %
-    burstiness = r.uniform(0, 1, size=n)             # unitless
+def train_model_fast():
+    X, y = make_dataset()
+    X = X.fillna(0.0)
 
-    # Attack rule: high jitter or high drop + bursts; or weird combo low throughput + high latency
-    score = 0.4*(jitter>10) + 0.3*(pkt_drop>2.5) + 0.2*(burstiness>0.7) + 0.2*((throughput<70)&(mean_latency>45))
-    y = (score + r.normal(0, 0.05, n) > 0.5).astype(int)
-    X = pd.DataFrame({
-        "mean_latency_ms": mean_latency,
-        "jitter_ms": jitter,
-        "throughput_mbps": throughput,
-        "packet_drop_pct": pkt_drop,
-        "burstiness": burstiness
-    })
-    return X, y
+    # Split: train, cal, test
+    X_tr, X_tmp, y_tr, y_tmp = train_test_split(X, y, test_size=0.4, random_state=SEED, stratify=y)
+    X_cal, X_te, y_cal, y_te = train_test_split(X_tmp, y_tmp, test_size=0.5, random_state=SEED, stratify=y_tmp)
 
-def gen_maintenance(n=900, seed=2):
-    r = np.random.default_rng(seed)
-    temp = r.normal(65, 15, size=n)                  # °C
-    vibration = r.normal(25, 8, size=n)              # Hz
-    pressure = r.normal(4, 1.2, size=n)              # bar
-    age = r.uniform(0, 10, size=n)                   # years
+    scaler = StandardScaler()
+    poly = PolynomialFeatures(degree=2, include_bias=False, interaction_only=True)
 
-    # Failure rule: high temp, high vibration, high age; pressure extremes
-    score = 0.35*(temp>75) + 0.3*(vibration>30) + 0.2*(age>6) + 0.15*((pressure<3)|(pressure>6))
-    y = (score + r.normal(0, 0.05, n) > 0.5).astype(int)
-    X = pd.DataFrame({
-        "temp_c": temp,
-        "vibration_hz": vibration,
-        "pressure_bar": pressure,
-        "age_years": age
-    })
-    return X, y
+    X_tr_s = scaler.fit_transform(X_tr)
+    X_tr_p = poly.fit_transform(X_tr_s)
 
-# --------- Demo 1: Resource Allocation with TreeSHAP --------- #
-if demo.startswith("1"):
-    st.header("1) Resource Allocation (TreeSHAP)")
-    st.write("**Question**: Why did the RL-inspired policy allocate bandwidth to Device A instead of B? "
-             "We train a simple Random Forest on synthetic network features and explain its decision with TreeSHAP.")
-    X, y = gen_resource_alloc()
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0, stratify=y)
+    # Tiny, fast model
+    model = LogisticRegression(
+        penalty="l2", C=1.0, solver="lbfgs", max_iter=300, class_weight="balanced"
+    ).fit(X_tr_p, y_tr)
 
-    clf = RandomForestClassifier(n_estimators=200, random_state=0, max_depth=6)
-    clf.fit(X_train, y_train)
-    preds = clf.predict_proba(X_test)[:,1]
-    st.write(f"**Accuracy**: {accuracy_score(y_test, (preds>0.5).astype(int)):.3f} • **ROC-AUC**: {roc_auc_score(y_test, preds):.3f}")
+    # Calibrate conformal nonconformity: 1 - p(correct)
+    X_cal_p = poly.transform(scaler.transform(X_cal))
+    proba_cal = model.predict_proba(X_cal_p)[:, 1]
+    cal_nc = 1 - np.where(y_cal == 1, proba_cal, 1 - proba_cal)
 
-    idx = st.slider("Choose a test sample to explain", min_value=0, max_value=len(X_test)-1, value=5, step=1)
-    x_instance = X_test.iloc[[idx]]
+    # Metrics
+    X_te_p = poly.transform(scaler.transform(X_te))
+    p_te = model.predict_proba(X_te_p)[:, 1]
+    auc = roc_auc_score(y_te, p_te)
+    preds = (p_te >= 0.75).astype(int)
+    prec, rec, f1, _ = precision_recall_fscore_support(y_te, preds, average="binary", zero_division=0)
 
-    if SHAP_AVAILABLE:
-        explainer = shap.TreeExplainer(clf)
-        shap_values = explainer.shap_values(x_instance)
-        st.subheader("Feature Contributions (SHAP)")
-        fig, ax = plt.subplots()
-        # For binary classifier, shap_values is a list [class0, class1]; pick class 1
-        vals = shap_values[1][0]
-        order = np.argsort(np.abs(vals))[::-1]
-        labels = x_instance.columns[order]
-        vals_sorted = vals[order]
-        ax.barh(labels, vals_sorted)
-        ax.invert_yaxis()
-        ax.set_xlabel("SHAP value → contribution to P(allocate_to_A)")
-        st.pyplot(fig)
-    else:
-        st.warning("SHAP not available in this environment; showing permutation importance instead.")
-        # Simple permutation importance as a fallback
-        base = clf.score(X_test, y_test)
-        imps = []
-        for col in X_test.columns:
-            Xp = X_test.copy()
-            Xp[col] = np.random.permutation(Xp[col].values)
-            imps.append(base - clf.score(Xp, y_test))
-        imp_series = pd.Series(imps, index=X_test.columns).sort_values(ascending=False)
-        st.bar_chart(imp_series)
+    st.session_state.scaler = scaler
+    st.session_state.poly = poly
+    st.session_state.model = model
+    st.session_state.feat_names = poly.get_feature_names_out(feat_cols()).tolist()
+    st.session_state.cal_nc = cal_nc
+    st.session_state.metrics = {"AUC": float(auc), "precision": float(prec), "recall": float(rec), "f1": float(f1)}
+    st.session_state.baseline = X.sample(min(1000, len(X)), random_state=SEED)
+    st.session_state.trained = True
 
-    st.markdown("**Takeaway**: TreeSHAP gives a local explanation per decision, showing which features pushed the model toward allocating bandwidth.")
+if not st.session_state.trained:
+    with st.spinner("Training ultra-light model…"):
+        train_model_fast()
 
-# --------- Demo 2: Network Anomaly Detection with LIME --------- #
-elif demo.startswith("2"):
-    st.header("2) Network Anomaly Detection (LIME)")
-    st.write("**Question**: Why did the detector flag this traffic as an attack? "
-             "We train a Gradient Boosting classifier and use LIME to explain a single prediction.")
-    X, y = gen_anomaly()
-    X_train, X_test, y_train, y_test = train_test_split(X.values, y, test_size=0.25, random_state=0, stratify=y)
+# -----------------------------
+# Conformal p-value
+# -----------------------------
+def conformal_p(prob1):
+    cal = st.session_state.cal_nc
+    if cal is None: return None
+    nc = 1 - prob1
+    return float((np.sum(cal >= nc) + 1) / (len(cal) + 1))
 
-    model = GradientBoostingClassifier(random_state=0)
-    model.fit(X_train, y_train)
-    preds = model.predict_proba(X_test)[:,1]
-    st.write(f"**Accuracy**: {accuracy_score(y_test, (preds>0.5).astype(int)):.3f} • **ROC-AUC**: {roc_auc_score(y_test, preds):.3f}")
+# -----------------------------
+# Streaming step
+# -----------------------------
+def step_once():
+    if st.session_state.trigger is None:
+        st.session_state.trigger = st.session_state.step + 5  # anomaly starts after 5 ticks
 
-    idx = st.slider("Choose a test sample to explain", min_value=0, max_value=len(X_test)-1, value=10, step=1)
-    x_instance = X_test[idx]
+    row = gen_normal_row()
+    if scenario != "Normal" and st.session_state.step >= st.session_state.trigger:
+        row = inject(row, scenario, t_since=st.session_state.step - st.session_state.trigger + 1)
 
-    if LIME_AVAILABLE:
-        explainer = LimeTabularExplainer(
-            training_data=X_train,
-            feature_names=list(pd.DataFrame(X).columns),
-            class_names=["normal","attack"],
-            discretize_continuous=True,
-            mode="classification"
-        )
-        exp = explainer.explain_instance(
-            x_instance, model.predict_proba, num_features=5, top_labels=1
-        )
-        st.subheader("Local Explanation (Top 5 contributions)")
-        df = pd.DataFrame(exp.as_list(), columns=["Feature", "Contribution"])
-        st.table(df)
-    else:
-        st.warning("LIME not available; showing simple feature sensitivity instead.")
-        base = model.predict_proba([x_instance])[0,1]
-        sens = []
-        cols = list(pd.DataFrame(X).columns)
-        for j, name in enumerate(cols):
-            x_mod = x_instance.copy()
-            x_mod[j] = x_mod[j] + 0.1*np.std(X_train[:,j])
-            new = model.predict_proba([x_mod])[0,1]
-            sens.append(new - base)
-        df = pd.DataFrame({"feature": cols, "delta_prob": sens}).sort_values("delta_prob", ascending=False)
-        st.table(df)
+    st.session_state.raw.append(row)
+    st.session_state.roll.append(row)
 
-    st.markdown("**Takeaway**: LIME provides an intuitive, local surrogate model that explains why this sample was labeled as an anomaly.")
+    feats = build_features(st.session_state.roll)
+    if not feats:
+        st.session_state.step += 1
+        return
 
-# --------- Demo 3: Predictive Maintenance with Counterfactuals --------- #
+    X1 = pd.DataFrame([feats]).fillna(0.0)
+    X1_p = st.session_state.poly.transform(st.session_state.scaler.transform(X1))
+    prob1 = float(st.session_state.model.predict_proba(X1_p)[0, 1])
+    pval = conformal_p(prob1) if use_conformal else None
+    fired = prob1 >= thr
+
+    # Local explanation (coef * feature value)
+    coefs = st.session_state.model.coef_[0]
+    contribs = coefs * X1_p[0]
+    # Map back to names
+    names = st.session_state.feat_names
+    pairs = sorted(zip(names, contribs), key=lambda x: abs(x[1]), reverse=True)[:8]
+    reasons = [{"feature": n, "impact": float(v)} for n, v in pairs]
+
+    if fired:
+        st.session_state.incidents.append({
+            "ts": int(time.time()),
+            "step": int(st.session_state.step),
+            "scenario": scenario,
+            "prob": prob1,
+            "p_value": pval,
+            "reasons": reasons,
+            "raw": row
+        })
+
+    st.session_state.last_pred = {
+        "prob": prob1, "p_value": pval, "fired": fired,
+        "reasons": reasons, "raw": row
+    }
+    st.session_state.step += 1
+
+# Run steps per refresh
+if auto:
+    for _ in range(speed):
+        step_once()
 else:
-    st.header("3) Predictive Maintenance (Counterfactuals)")
-    st.write("**Question**: The model predicts failure—*what needs to change to avoid it?* "
-             "We train a simple logistic regression and provide a what-if and counterfactual search.")
-    X, y = gen_maintenance()
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=1, stratify=y)
+    if st.button("Step once"):
+        step_once()
 
-    pipe = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=1000))
-    ])
-    pipe.fit(X_train, y_train)
-    preds = pipe.predict_proba(X_test)[:,1]
-    st.write(f"**Accuracy**: {accuracy_score(y_test, (preds>0.5).astype(int)):.3f} • **ROC-AUC**: {roc_auc_score(y_test, preds):.3f}")
+# -----------------------------
+# KPI row
+# -----------------------------
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("Current Risk (prob)", f"{(st.session_state.last_pred or {}).get('prob', 0.0):.2f}")
+with c2:
+    st.metric("Incidents (session)", len(st.session_state.incidents))
+with c3:
+    st.metric("Model AUC", f"{st.session_state.metrics.get('AUC', 0.0):.2f}")
+with c4:
+    pv = (st.session_state.last_pred or {}).get("p_value", None)
+    st.metric("Conformal p-value", f"{pv:.3f}" if pv is not None else "—")
 
-    st.subheader("What-if controls")
-    c1, c2, c3, c4 = st.columns(4)
-    temp = c1.slider("temp_c", float(X["temp_c"].min()), float(X["temp_c"].max()), float(np.median(X["temp_c"])))
-    vib = c2.slider("vibration_hz", float(X["vibration_hz"].min()), float(X["vibration_hz"].max()), float(np.median(X["vibration_hz"])))
-    press = c3.slider("pressure_bar", float(X["pressure_bar"].min()), float(X["pressure_bar"].max()), float(np.median(X["pressure_bar"])))
-    age = c4.slider("age_years", float(X["age_years"].min()), float(X["age_years"].max()), float(np.median(X["age_years"])))
+# -----------------------------
+# Tabs
+# -----------------------------
+tab_overview, tab_details, tab_insights = st.tabs(["Overview", "Details", "Insights"])
 
-    x_cur = pd.DataFrame([[temp, vib, press, age]], columns=X.columns)
-    prob_fail = pipe.predict_proba(x_cur)[0,1]
-    st.metric("Predicted Failure Probability", f"{prob_fail:.2%}")
+# ---- Overview
+with tab_overview:
+    left, right = st.columns([2,1])
+    with left:
+        st.subheader("Live Metrics")
+        if len(st.session_state.raw) > 0:
+            df = pd.DataFrame(list(st.session_state.raw))
+            df["t"] = np.arange(len(df))
+            chart = alt.Chart(df).transform_fold(
+                ["snr", "packet_loss", "latency_ms", "pos_error_m"],
+                as_=["metric","value"]
+            ).mark_line().encode(
+                x="t:Q", y="value:Q", color="metric:N"
+            ).properties(height=300)
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("Waiting for stream…")
 
-    st.subheader("Find a simple counterfactual")
-    target_prob = st.slider("Target max failure probability", 0.01, 0.49, 0.20, 0.01)
+        st.subheader("Incidents")
+        if not st.session_state.incidents:
+            st.success("No incidents yet.")
+        else:
+            for i, inc in enumerate(reversed(st.session_state.incidents[-10:]), 1):
+                with st.expander(f"#{len(st.session_state.incidents)-i+1} • {inc['scenario']} • prob={inc['prob']:.2f} • p={inc['p_value']:.3f if inc['p_value'] else '—'}"):
+                    colA, colB = st.columns([2,1])
+                    with colA:
+                        txt = "\n".join([f"- {r['feature']}: {r['impact']:+.3f}" for r in inc["reasons"]])
+                        st.markdown("**Why flagged (top contributions)**\n\n" + txt)
+                        st.markdown("**Suggested action**")
+                        if inc["scenario"] == "Jamming":
+                            st.write("Hop channel; run spectrum scan; consider directional antenna.")
+                        elif inc["scenario"] == "GPS Spoofing":
+                            st.write("Enable multi-source fusion (Wi-Fi/UWB); verify time source; apply geofence checks.")
+                        elif inc["scenario"] == "Wi-Fi Breach":
+                            st.write("Quarantine SSID/VLAN; rotate keys; check for rogue APs.")
+                        else:
+                            st.write("Reject tampered data; verify signatures; audit gateway.")
+                    with colB:
+                        st.json({"prob": inc["prob"], "p_value": inc["p_value"], "step": inc["step"]})
 
-    # Greedy counterfactual: nudge features along direction that reduces failure prob
-    # Use model coefficients (in standardized space) to get influence directions
-    scaler = pipe.named_steps["scaler"]
-    clf = pipe.named_steps["clf"]
-    coefs = clf.coef_[0]
+    with right:
+        st.subheader("Trust widget")
+        if st.session_state.last_pred and use_conformal:
+            p = st.session_state.last_pred["p_value"]
+            st.metric("Calibrated risk (%)", f"{(1 - (p or 0))*100:.1f}")
+            st.caption("Lower p-value = higher risk (inductive conformal).")
+        else:
+            st.info("Enable conformal in the sidebar.")
+        if st.session_state.incidents:
+            df_inc = pd.DataFrame(st.session_state.incidents)
+            df_inc["top_features"] = df_inc["reasons"].apply(lambda r: "; ".join([f"{x['feature']}:{x['impact']:+.3f}" for x in r]))
+            csv = df_inc.drop(columns=["reasons"]).to_csv(index=False).encode("utf-8")
+            st.download_button("Download incidents CSV", csv, "incidents.csv", "text/csv")
 
-    def to_std(x_df):
-        return (x_df.values - scaler.mean_) / np.sqrt(scaler.var_)
+# ---- Details (operator)
+with tab_details:
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### Selected metrics")
+        if len(st.session_state.raw) > 0:
+            df = pd.DataFrame(list(st.session_state.raw))
+            df["t"] = np.arange(len(df))
+            for y in ["snr", "packet_loss", "latency_ms", "channel_util"]:
+                st.line_chart(df.set_index("t")[y], height=160)
+    with col2:
+        st.markdown("### Last decision — local explanation")
+        lp = st.session_state.last_pred
+        if lp:
+            df_pairs = pd.DataFrame(lp["reasons"], columns=["feature","impact"])
+            bar = alt.Chart(df_pairs).mark_bar().encode(
+                x=alt.X("impact:Q", title="Contribution (coef × value)"),
+                y=alt.Y("feature:N", sort="-x", title="Feature term")
+            ).properties(height=260)
+            st.altair_chart(bar, use_container_width=True)
+            st.caption("Counterfactual hint: reducing the largest positive contributors would lower the alert probability.")
 
-    def to_orig(x_std):
-        return x_std * np.sqrt(scaler.var_) + scaler.mean_
+# ---- Insights (technical)
+with tab_insights:
+    st.markdown("### Global importance (mean |contribution| on baseline)")
+    if st.session_state.baseline is not None:
+        base = st.session_state.baseline.fillna(0.0)
+        base_p = st.session_state.poly.transform(st.session_state.scaler.transform(base))
+        coefs = st.session_state.model.coef_[0]
+        contrib = np.abs(base_p * coefs).mean(axis=0)
+        names = st.session_state.feat_names
+        imp = pd.DataFrame({"feature": names, "mean_abs_contrib": contrib}).sort_values("mean_abs_contrib", ascending=False).head(15)
+        bar = alt.Chart(imp).mark_bar().encode(
+            x="mean_abs_contrib:Q", y=alt.Y("feature:N", sort="-x")
+        ).properties(height=320)
+        st.altair_chart(bar, use_container_width=True)
 
-    x_std = to_std(x_cur)
-    cur_prob = prob_fail
-    steps = []
-    max_iters = 200
-    lr = 0.1  # step size in standardized space
+    st.markdown("### Model card")
+    st.json({
+        "model": "Logistic Regression with interaction terms (degree=2, interaction_only=True)",
+        "training": st.session_state.metrics,
+        "features": len(st.session_state.feat_names or []),
+        "explanations": "Coefficient × feature value (local & global)",
+        "conformal": "Inductive conformal p-value on validation split",
+        "intended_use": "Demo of trustworthy AI for wireless anomaly detection",
+        "limitations": [
+            "Synthetic data; thresholds illustrative",
+            "Single-device stream for simplicity"
+        ],
+        "version": "v2-ultralight"
+    })
 
-    bounds = np.array([[X[c].min(), X[c].max()] for c in X.columns])
-
-    for it in range(max_iters):
-        if cur_prob <= target_prob:
-            break
-        # Move opposite to positive coefficients (reduce logit)
-        direction = -np.sign(coefs)
-        x_std = x_std + lr * direction  # nudge each feature
-        # Project back to original bounds
-        x_new = to_orig(x_std)[0]
-        x_new = np.clip(x_new, bounds[:,0], bounds[:,1])
-        x_std = (x_new - scaler.mean_) / np.sqrt(scaler.var_)
-        prob = pipe.predict_proba(pd.DataFrame([x_new], columns=X.columns))[0,1]
-        steps.append((it+1, x_new.copy(), prob))
-
-        # Reduce step size if oscillating
-        if len(steps)>2 and steps[-1][2] > steps[-2][2]:
-            lr *= 0.5
-        cur_prob = prob
-
-    if steps:
-        iters, xs, probs = zip(*steps)
-        best_idx = int(np.argmin(probs))
-        x_cf = xs[best_idx]
-        p_cf = probs[best_idx]
-        df_compare = pd.DataFrame([x_cur.iloc[0].values, x_cf], columns=X.columns, index=["current","counterfactual"]).T
-        st.write("**Suggested counterfactual changes** (minimal greedy):")
-        st.dataframe(df_compare.style.format("{:.2f}"))
-        st.metric("Counterfactual Failure Probability", f"{p_cf:.2%}")
-        st.caption("Note: Simple greedy search; for production, consider DiCE or optimization-based counterfactuals with cost/feasibility constraints.")
-    else:
-        st.info("Current configuration already below the target failure probability.")
-
-    st.markdown("**Takeaway**: Counterfactuals provide actionable guidance — what needs to change to lower risk.")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("**How this maps to your lectures**")
-st.sidebar.markdown('''
-- Lecture 1: Motivation & Trustworthy AI framing
-- Lecture 2: Methods (TreeSHAP, LIME) + Demos 1 & 2
-- Lecture 3: Actionability & Future (Counterfactuals) + Demo 3
-''')
+st.caption("Tip: Switch scenario in the sidebar; this build is optimized for Streamlit Cloud (no Plotly/SHAP).")
