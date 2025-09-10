@@ -44,7 +44,7 @@ CFG = Config()
 # -----------------------------
 st.set_page_config(page_title="TRUST AI: Wireless Threat Detection (Demo)", layout="wide")
 st.title("TRUST AI — Wireless Threat Detection (Demo)")
-st.caption("LightGBM + SHAP + Conformal Risk • Multi-level XAI UI (General • Manager • Policymaker • Researcher)")
+st.caption("LightGBM + SHAP + Conformal Risk • Persona-based XAI (End Users • Domain Experts • Regulators • AI Builders • Executives)")
 
 # -----------------------------
 # Sidebar controls
@@ -86,7 +86,6 @@ def shap_pos_class_values(explainer, X_df):
 
 def severity_from(prob, pval):
     """Map model prob & conformal p-value to a severity label and color."""
-    # Lower p-value => higher risk. Use both signals if available.
     high = (prob >= 0.85) or (pval is not None and pval <= 0.05)
     med  = (prob >= 0.70) or (pval is not None and pval <= 0.20)
     if high:   return "High", "red"
@@ -95,6 +94,15 @@ def severity_from(prob, pval):
 
 def bullet(text):
     return f"- {text}"
+
+def scenario_actions(scen):
+    if scen == "Jamming":
+        return ["Channel hop", "Quick spectrum scan", "Enable directional/backup link"]
+    if scen == "GPS Spoofing":
+        return ["Switch to multi-source positioning", "Verify time source", "Apply geofence sanity checks"]
+    if scen == "Wi-Fi Breach":
+        return ["Quarantine SSID/VLAN", "Rotate keys", "Rogue AP scan"]
+    return ["Reject bad packets", "Verify signatures", "Audit gateway"]
 
 # -----------------------------
 # Session state init
@@ -423,7 +431,7 @@ with kpi_cols[3]:
 # -----------------------------
 tab_overview, tab_details, tab_insights = st.tabs(["Overview", "Details", "Insights"])
 
-# ---- Overview (business)
+# ---- Overview (persona-focused incidents)
 with tab_overview:
     left, right = st.columns([2, 1])
 
@@ -454,59 +462,55 @@ with tab_overview:
 
                     c1, c2 = st.columns([2, 1])
                     with c1:
-                        # Audience-specific explanations
-                        tabs = st.tabs(["General", "Manager", "Policymaker", "Researcher"])
+                        tabs = st.tabs([
+                            "End Users",
+                            "Domain Experts",
+                            "Regulators",
+                            "AI Builders",
+                            "Executives"
+                        ])
 
-                        # ------- General (normal user)
+                        # ------- End Users Impacted by Decisions
                         with tabs[0]:
-                            st.markdown("#### What happened (plain language)")
-                            st.write(f"The system noticed unusual wireless behavior consistent with **{inc['scenario']}**.")
-                            st.markdown("#### Why it matters")
+                            st.markdown("#### What happened (simple)")
+                            st.write(f"The system noticed behavior that looks like **{inc['scenario']}**.")
+                            st.markdown("#### What it means for me")
                             if inc["scenario"] == "Jamming":
-                                st.write("Connections may slow down or cut out briefly.")
+                                st.write("You might experience slower connection or brief dropouts.")
                             elif inc["scenario"] == "GPS Spoofing":
-                                st.write("Location on the map may jump to the wrong place.")
+                                st.write("Your location on the map may be wrong for a short time.")
                             elif inc["scenario"] == "Wi-Fi Breach":
-                                st.write("An unknown device may be trying to access the network.")
+                                st.write("An unknown device may be trying to use this network.")
                             else:
-                                st.write("Some data looks tampered or inconsistent.")
+                                st.write("Some data looks inconsistent and might be rejected.")
                             st.markdown("#### What to do now")
-                            if inc["scenario"] == "Jamming":
-                                st.write("Try a different channel or move away from the interference source.")
-                            elif inc["scenario"] == "GPS Spoofing":
-                                st.write("Double-check location with a second source (e.g., Wi-Fi/UWB).")
-                            elif inc["scenario"] == "Wi-Fi Breach":
-                                st.write("Change Wi-Fi password for this area and check for unknown devices.")
-                            else:
-                                st.write("Retry the operation; if it repeats, contact your admin.")
+                            actions = scenario_actions(inc["scenario"])
+                            st.write(" • " + " • ".join(actions[:2]))
                             if pv is not None:
-                                st.caption(f"Confidence: calibrated p-value = {pv_str} (lower means higher risk).")
+                                st.caption(f"Confidence (lower = riskier): p-value = {pv_str}")
 
-                        # ------- Manager
+                        # ------- Domain Experts & Practitioners
                         with tabs[1]:
-                            st.markdown("#### Impact & recommended actions")
-                            st.write(bullet("Operational impact: temporary slowdown / position errors / elevated auth failures (depending on scenario)."))
-                            st.write(bullet(f"Severity: **{sev}** (model prob={inc['prob']:.2f}, p={pv_str})"))
-                            if inc["scenario"] == "Jamming":
-                                st.write(bullet("Actions (priority): 1) Channel hop, 2) Run quick spectrum scan, 3) Enable directional/backup link."))
-                            elif inc["scenario"] == "GPS Spoofing":
-                                st.write(bullet("Actions (priority): 1) Switch to multi-source positioning, 2) Verify time source, 3) Apply geofence sanity checks."))
-                            elif inc["scenario"] == "Wi-Fi Breach":
-                                st.write(bullet("Actions (priority): 1) Quarantine SSID/VLAN, 2) Rotate keys, 3) Rogue AP scan."))
-                            else:
-                                st.write(bullet("Actions (priority): 1) Reject bad packets, 2) Verify signatures, 3) Audit gateway."))
-                            st.markdown("#### KPIs to watch")
-                            st.write(bullet("MTTA (time to alert), ongoing incident count, packet loss, latency, SNR"))
+                            st.markdown("#### Operational assessment")
+                            st.write(bullet(f"Severity **{sev}** (prob={inc['prob']:.2f}, p={pv_str})"))
+                            st.write(bullet("Likely root-cause region: RF interference / auth-plane / positioning stack (by scenario)."))
+                            st.markdown("#### Recommended playbook (priority)")
+                            for idx, a in enumerate(scenario_actions(inc["scenario"]), 1):
+                                st.write(f"{idx}. {a}")
+                            st.markdown("#### Key observables")
+                            obs = []
+                            for r in inc["reasons"]:
+                                obs.append(f"{r['feature']} ({r['impact']:+.3f})")
+                            st.write(" • " + " • ".join(obs))
 
-                        # ------- Policymaker
+                        # ------- Regulatory Authorities
                         with tabs[2]:
-                            st.markdown("#### Assurance & transparency")
-                            st.write(bullet("Transparent reasoning: model shows top factors (below) and a human-readable summary."))
+                            st.markdown("#### Assurance & governance")
+                            st.write(bullet("Decision transparency: model shows top contributing factors and plain-language summary."))
                             st.write(bullet(f"Calibrated confidence: conformal p-value = {pv_str} (target coverage {int(CFG.coverage*100)}%)."))
-                            st.write(bullet("Auditability: incident JSON includes model version, timestamp, features & attributions."))
-                            st.write(bullet("Data protection by design: this demo uses technical telemetry only (no personal data)."))
-                            st.write(bullet("Monitoring: distribution drift checks run continuously (see Insights ▸ Drift)."))
-                            # Evidence download (JSON)
+                            st.write(bullet("Audit trail: downloadable incident evidence with model version & inputs."))
+                            st.write(bullet("Data scope in this demo: technical telemetry only (no personal data)."))
+                            st.write(bullet("Ongoing monitoring: distribution drift checks (see Insights ▸ Drift)."))
                             evidence = {
                                 "ts": inc["ts"],
                                 "step": inc["step"],
@@ -514,7 +518,7 @@ with tab_overview:
                                 "severity": sev,
                                 "prob": inc["prob"],
                                 "p_value": inc["p_value"],
-                                "model_version": "LightGBM v1.1-demo",
+                                "model_version": "LightGBM v1.3-demo",
                                 "explanations": inc["reasons"],
                                 "raw_sample": inc["raw"]
                             }
@@ -525,12 +529,28 @@ with tab_overview:
                                 mime="application/json"
                             )
 
-                        # ------- Researcher
+                        # ------- AI Builders, Software Engineers, Researchers & Innovators
                         with tabs[3]:
-                            st.markdown("#### Top local contributions (SHAP)")
+                            st.markdown("#### Local technical explanation (SHAP)")
                             reasons_txt = "\n".join([f"- {r['feature']}: {r['impact']:+.3f}" for r in inc["reasons"]])
                             st.markdown(reasons_txt)
-                            st.caption("Positive impact pushes toward 'anomaly'. Values reflect standardized feature space.")
+                            st.caption("Positive impact pushes toward 'anomaly'. Values in standardized feature space.")
+                            st.markdown("#### Implementation details")
+                            st.write(bullet("Model: LightGBM (depth≤3, ~60 trees), threshold on predicted prob."))
+                            st.write(bullet("Calibration: inductive conformal p-value for risk display."))
+                            st.write(bullet("Features: short-window means/std/gradients/z-scores over network/position metrics."))
+
+                        # ------- Business Leaders & Executives
+                        with tabs[4]:
+                            st.markdown("#### Executive summary")
+                            st.write(bullet(f"Severity **{sev}**; scenario: **{inc['scenario']}**."))
+                            st.write(bullet("Potential impact: short-term service degradation or location inaccuracy; mitigations available."))
+                            st.markdown("#### Decision & ROI")
+                            st.write(bullet("Immediate action recommended (minutes-level) to reduce risk of SLA breach."))
+                            st.write(bullet("Mitigation costs are low (config changes/scans); high benefit by avoiding downtime."))
+                            st.markdown("#### KPIs to watch")
+                            st.write(bullet("Incidents today, Mean Time To Detect (MTTD), Packet loss, Latency, SNR"))
+                            st.caption("This demo uses synthetic data; numbers illustrate the workflow rather than real costs.")
 
                     with c2:
                         st.json({
@@ -629,7 +649,7 @@ with tab_insights:
             "Synthetic data; thresholds illustrative",
             "Single-device view; multi-device aggregation omitted for brevity"
         ],
-        "version": "v1.2-demo"
+        "version": "LightGBM v1.3-demo"
     })
 
-st.caption("Tip: Each incident now includes audience-specific explanations (General • Manager • Policymaker • Researcher).")
+st.caption("Tip: Each incident now includes persona-specific explanations (End Users • Domain Experts • Regulators • AI Builders • Executives).")
