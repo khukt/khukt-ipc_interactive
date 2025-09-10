@@ -526,7 +526,8 @@ with tab_overview:
                                 "Download incident evidence (JSON)",
                                 data=json.dumps(evidence, indent=2).encode("utf-8"),
                                 file_name=f"incident_{inc['ts']}.json",
-                                mime="application/json"
+                                mime="application/json",
+                                key=f"dl_evidence_{inc['ts']}_{inc['step']}"   # <-- unique key per incident
                             )
 
                         # ------- AI Builders, Software Engineers, Researchers & Innovators
@@ -581,7 +582,13 @@ with tab_overview:
                 lambda r: "; ".join([f"{x['feature']}:{x['impact']:+.3f}" for x in r])
             )
             csv = df_inc.drop(columns=["reasons"]).to_csv(index=False).encode("utf-8")
-            st.download_button("Download incidents CSV", csv, "incidents.csv", "text/csv")
+            st.download_button(
+                "Download incidents CSV",
+                csv,
+                "incidents.csv",
+                "text/csv",
+                key="dl_incidents_csv"  # <-- stable unique key
+            )
 
 # ---- Details (operator)
 with tab_details:
