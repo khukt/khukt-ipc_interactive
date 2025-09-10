@@ -95,9 +95,9 @@ with st.sidebar:
         breach_mode = st.radio("Breach mode", ["Evil Twin", "Rogue Open AP", "Credential hammer"], index=0, key="breach_mode")
         CFG.breach_radius_m = st.slider("Rogue AP lure radius (m)", 50, 300, CFG.breach_radius_m, 10, key="breach_radius")
     if scenario.startswith("GPS Spoofing"):
-        spoof_mode = st.radio("Spoofing scope", ["Single device", "Localized area", "Site-wide"], index=1)
-        spoof_mobile_only = st.checkbox("Affect mobile (AMR/Truck) only", True)
-        CFG.spoof_radius_m = st.slider("Spoof coverage (m)", 50, 500, CFG.spoof_radius_m, 10)
+        st.session_state["spoof_mode"] = st.radio("Spoofing scope", ["Single device", "Localized area", "Site-wide"], index=1, key="spoof_mode")
+        st.session_state["spoof_mobile_only"] = st.checkbox("Affect mobile (AMR/Truck) only", True, key="spoof_mobile_only")
+        CFG.spoof_radius_m = st.slider("Spoof coverage (m)", 50, 500, CFG.spoof_radius_m, 10, key="spoof_radius")
 
     speed = st.slider("Playback speed (ticks/refresh)", 1, 10, 3)
     auto = st.checkbox("Auto stream", True)
@@ -317,7 +317,7 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
     if str(scen).startswith("Wi-Fi Breach") and d_rog <= CFG.breach_radius_m:
         if row.type in MOBILE_TYPES or np.random.rand()<0.3:
             rog_rssi = -40 - 18 * math.log10(max(1.0, d_rog)) + np.random.normal(0, 2)
-            rogue_rssi_gap = float(rog_rssi - rssi)
+            rogue_rssi_gap = float(rogue_rssi - rssi)
             if breach_mode == "Evil Twin" or breach_mode is None:
                 deauth_rate      = float(np.clip(deauth_rate + np.random.uniform(0.25, 0.60), 0, 1.0))
                 assoc_churn      = float(np.clip(assoc_churn + np.random.uniform(0.25, 0.50), 0, 1.0))
@@ -330,52 +330,22 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
                 eapol_retry_rate = float(np.clip(eapol_retry_rate + np.random.uniform(0.35, 0.70), 0, 1.0))
                 auth_fail        += np.random.uniform(0.4, 0.9)
 
-    # ---------- GPS Spoofing realism ----------
+    # ---------- GPS Spoofing realism (for TRAINING only here) ----------
     pos_error = np.random.normal(2.0, 0.7)
-    if str(scen).startswith("GPS Spoofing"):
-        # Decide targeting
-        hit = False
-        if 'spoof_mode' in globals():
-            pass  # running in function scope
-        spoof_scope = st.session_state.get("spoof_scope")
-        # sidebar uses local variables; but we can read from outer if present
-        spoof_scope = st.session_state.get("spoof_scope_override", None)
-        # fallback: infer from widgets by storing once
-        # simpler: re-evaluate using current sidebar inputs if exist
-        # We'll directly access from widgets saved earlier:
-        try:
-            spoof_scope = st.session_state.get("_radio", None)  # not reliable
-        except Exception:
-            spoof_scope = None
-        # Instead, reconstruct from top-level context:
-        spoof_scope = st.session_state.get("spoof_scope", None)
-
-        # We can't rely on the above; instead, query Streamlit session directly via known keys we set:
-        spoof_mode_local = st.session_state.get("Spoofing scope", None)  # may not exist
-        # Given widget keys vary across sessions, use safer logic:
-        # We'll recompute based on distance & one-target retention:
-
-        # Single device mode replicated using session cache
-        if "spoof_mode_choice" in st.session_state:
-            mode_choice = st.session_state["spoof_mode_choice"]
-        else:
-            mode_choice = None
-
-        # Infer from presence of sidebar radio: we stored earlier while building sidebar
-        mode_choice = st.session_state.get("jam_mode", None)  # wrong key; ignore
-        # Instead, we pass spoofing behavior via globals in tick_once(); here we just use distance & cached target.
-        # Determine effect below using globals set in tick_once()
-
-    # (We will actually handle spoofing targeting in tick_once() and pass booleans there.)
+    if str(scen).startswith("GPS Spoofing") and training:
+        minutes = tick / 60.0
+        bias = 20.0
+        drift = 6.0 * minutes
+        pos_error += np.random.uniform(0.6*bias, 1.2*bias) + 0.5*drift
 
     # ---------- Data Tamper realism ----------
-    # Integrity/freshness baseline
+    # Integrity/freshness baseline (robust to new IDs like T00 during training)
     if "seq_counter" not in st.session_state:
         st.session_state.seq_counter = {}
     if row.device_id not in st.session_state.seq_counter:
         st.session_state.seq_counter[row.device_id] = 0
     st.session_state.seq_counter[row.device_id] += 1
-    seq_no = st.session_state.seq_counter[row.device_id]
+
     device_ts = tick + np.random.normal(0, 0.05)
     payload_entropy = float(np.random.normal(5.8, 0.4))
     ts_skew_s = float(device_ts - tick)
@@ -399,8 +369,8 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
             schema_violation_rate += float(np.random.uniform(0.05, 0.20))
             if crypto_enabled: hmac_fail_rate += float(np.random.uniform(0.3, 0.8))
         elif tm == "Bias/Drift":
-            drift = float(np.random.uniform(5, 15))
-            thr = max(1.0, thr - drift)
+            drift_amt = float(np.random.uniform(5, 15))
+            thr = max(1.0, thr - drift_amt)
             latency += float(np.random.uniform(10, 30))
             payload_entropy = float(np.random.uniform(4.0, 5.0))
             schema_violation_rate += float(np.random.uniform(0.02, 0.08))
@@ -486,6 +456,7 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
                          speed_mps=(np.random.uniform(0.5,2.5) if d_type in MOBILE_TYPES else 0.0),
                          heading=np.random.uniform(0,2*np.pi)))
     D=pd.DataFrame(devs)
+
     # Ensure seq counters exist for training-time device IDs
     if "seq_counter" not in st.session_state:
         st.session_state.seq_counter = {}
@@ -660,16 +631,12 @@ def tick_once():
 
         # Apply GPS spoofing scope here (single/local/site-wide)
         if scenario.startswith("GPS Spoofing"):
-            hit = False
             spf = st.session_state.spoofer
             d_spf = haversine_m(row.lat, row.lon, spf["lat"], spf["lon"])
-            try:
-                current_scope = st.session_state["Spoofing scope"]  # may not exist
-            except KeyError:
-                current_scope = None
-            # Read from radio value if present in widget state
-            # Fallback to heuristics: assume Localized by default
-            selected = current_scope if isinstance(current_scope, str) else "Localized area"
+            selected = st.session_state.get("spoof_mode", "Localized area")
+            mobile_only = st.session_state.get("spoof_mobile_only", True)
+
+            hit = False
             if selected == "Site-wide":
                 hit = True
             elif selected == "Single device":
@@ -677,7 +644,7 @@ def tick_once():
             else:  # Localized area
                 hit = (d_spf <= CFG.spoof_radius_m)
 
-            if hit and (row.type in MOBILE_TYPES or st.session_state.get("spoof_mobile_only", True) is False):
+            if hit and (not mobile_only or row.type in MOBILE_TYPES):
                 minutes = tick / 60.0
                 bias = 20.0
                 drift = 6.0 * minutes
@@ -854,7 +821,6 @@ with tab_overview:
                                                          CFG.breach_radius_m * math.cos(a),
                                                          st.session_state.devices.lat.mean())[1],
                     rog["lat"] + meters_to_latlon_offset(CFG.breach_radius_m * math.sin(a),
-                                                         CFG.breach_radius_m * math.cos(a),
                                                          st.session_state.devices.lat.mean())[0]
                 ] for a in angles]}]
                 layers.append(pdk.Layer("PathLayer", circle, get_path="path", get_color=[0,200,200], width_scale=4, width_min_pixels=1, opacity=0.25))
