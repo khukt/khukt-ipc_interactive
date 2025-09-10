@@ -33,17 +33,19 @@ np.random.seed(SEED)
 @dataclass
 class Config:
     n_devices: int = 30
-    rolling_len: int = 8         # ~8 ticks per-device window
+    rolling_len: int = 8
     max_plot_points: int = 1200
     threshold: float = 0.75
     coverage: float = 0.90
     n_estimators: int = 60
     max_depth: int = 3
     learning_rate: float = 0.08
-    site_center: tuple = (59.3293, 18.0686)  # Stockholm-ish
+    # OLD: site_center: tuple = (59.3293, 18.0686)  # Stockholm-ish
+    site_center: tuple = (62.3925, 17.3066)        # Sundsvall — Mid Sweden University area
     site_radius_m: float = 400
     jam_radius_m: float = 200
     retrain_on_start: bool = True
+
 
 CFG = Config()
 
