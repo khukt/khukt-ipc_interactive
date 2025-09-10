@@ -26,12 +26,12 @@ warnings.filterwarnings(
     category=UserWarning
 )
 
-# =========================
-# Config & constants
-# =========================
 SEED = 42
 np.random.seed(SEED)
 
+# =========================
+# Config & constants
+# =========================
 @dataclass
 class Config:
     n_devices: int = 30
@@ -61,7 +61,9 @@ RAW_FEATURES = [
     "pos_error_m","auth_fail_rate","crc_err","throughput_mbps","channel_util",
     "payload_entropy","ts_skew_s","seq_gap","dup_ratio","schema_violation_rate","hmac_fail_rate",
     "noise_floor_dbm","cca_busy_frac","phy_error_rate","beacon_miss_rate","deauth_rate",
-    "assoc_churn","eapol_retry_rate","dhcp_fail_rate","rogue_rssi_gap"
+    "assoc_churn","eapol_retry_rate","dhcp_fail_rate","rogue_rssi_gap",
+    # GNSS realism
+    "gnss_sats","gnss_hdop","gnss_doppler_var","gnss_clk_drift_ppm"
 ]
 
 FEATURE_GLOSSARY = {
@@ -72,9 +74,9 @@ FEATURE_GLOSSARY = {
     "pos_error_m": "GNSS position error (m): higher suggests spoofing or weak satellites.",
     "noise_floor_dbm": "RF noise floor (dBm): higher noise reduces usable SNR.",
     "cca_busy_frac": "Channel busy fraction: how often the medium is sensed busy.",
-    "phy_error_rate": "PHY-layer error rate: frame decode errors on the radio.",
-    "beacon_miss_rate": "Missed AP beacons: losing sync with AP.",
-    "deauth_rate": "Deauthentication bursts: classic evil-twin/jam signal.",
+    "phy_error_rate": "PHY-layer error rate / BLER-ish.",
+    "beacon_miss_rate": "Missed AP beacons (Wi-Fi/private-5G).",
+    "deauth_rate": "Deauthentication bursts (Wi-Fi) / attach pressure (cellular).",
     "assoc_churn": "Association/roaming churn (or cellular reattach churn).",
     "eapol_retry_rate": "802.1X retries (or cellular attach/auth retries).",
     "dhcp_fail_rate": "DHCP failure rate (or session/IP setup failures).",
@@ -89,7 +91,11 @@ FEATURE_GLOSSARY = {
     "channel_util": "Channel utilization (%): how busy the medium is.",
     "rssi": "Received signal strength (dBm): higher is closer/clearer.",
     "auth_fail_rate": "Authentication failures.",
-    "crc_err": "CRC errors (count): integrity errors at frame level."
+    "crc_err": "CRC errors (count): integrity errors at frame level.",
+    "gnss_sats": "Satellites used in fix (count): typical 8–14; sudden drops are suspicious.",
+    "gnss_hdop": "Horizontal Dilution of Precision: geometry quality; <1 good, >2 poor. Odd combos can indicate spoofing.",
+    "gnss_doppler_var": "Variance of Doppler residuals: inconsistency across satellites suggests spoofing.",
+    "gnss_clk_drift_ppm": "Receiver clock drift (ppm): abnormal jumps suggest time spoof/replay."
 }
 
 DEVICE_TYPES = ["AMR", "Truck", "Sensor", "Gateway"]
@@ -242,7 +248,7 @@ def incident_id(inc):
 def model_card_data():
     return {
         "model": "LightGBM (binary) on rolling-window features",
-        "version": "v2.6-sundsvall",
+        "version": "v2.7-sundsvall",
         "features_per_device": len(feature_cols()),
         "window_length": CFG.rolling_len,
         "hyperparameters": {
@@ -369,6 +375,10 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
     if jam_mode is None: jam_mode = st.session_state.get("jam_mode")
     if breach_mode is None: breach_mode = st.session_state.get("breach_mode")
 
+    # During training, emulate reality: Trucks/Gateways cellular by default
+    if training:
+        st.session_state["cellular_mode"] = (row.type in {"Truck","Gateway"})
+
     ap   = st.session_state.ap
     jam  = st.session_state.jammer
     rog  = st.session_state.rogue
@@ -397,42 +407,48 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
     dhcp_fail_rate  = float(np.clip(np.random.beta(1,200), 0.0, 1.0))
     rogue_rssi_gap  = -30.0
 
-    # Jamming realism
+    # -------- Jamming realism (cellular-aware & stronger) --------
     if str(scen).startswith("Jamming") and d_jam <= CFG.jam_radius_m:
-        factor = max(0.15, 1.0 - d_jam/CFG.jam_radius_m)
+        reach = max(0.15, 1.0 - d_jam/CFG.jam_radius_m)
+        cellular_mode = st.session_state.get("cellular_mode", False)
         if jam_mode == "Broadband noise" or jam_mode is None:
-            jam_penalty     += np.random.uniform(8, 15) * factor
-            noise_floor_dbm += np.random.uniform(8, 15) * factor
-            cca_busy_frac    = float(np.clip(cca_busy_frac + 0.25*factor + 0.15*np.random.rand(), 0, 0.98))
-            phy_error_rate   = float(np.clip(phy_error_rate + 0.15*factor + 0.10*np.random.rand(), 0, 0.9))
-            beacon_miss_rate = float(np.clip(beacon_miss_rate + 0.10*factor + 0.10*np.random.rand(), 0, 1.0))
+            bump = np.random.uniform(10, 22) * reach
+            jam_penalty     += bump
+            noise_floor_dbm += bump * np.random.uniform(0.8, 1.1)
+            if cellular_mode:
+                phy_error_rate   = float(np.clip(phy_error_rate + 0.25*reach + 0.15*np.random.rand(), 0, 0.95))
+                assoc_churn      = float(np.clip(assoc_churn + 0.20*reach + 0.10*np.random.rand(), 0, 1.0))
+            else:
+                cca_busy_frac    = float(np.clip(cca_busy_frac + 0.25*reach + 0.15*np.random.rand(), 0, 0.98))
+                phy_error_rate   = float(np.clip(phy_error_rate + 0.20*reach + 0.10*np.random.rand(), 0, 0.95))
+                beacon_miss_rate = float(np.clip(beacon_miss_rate + 0.10*reach + 0.10*np.random.rand(), 0, 1.0))
         elif jam_mode == "Reactive":
-            util = (0.4+0.5*load)
-            jam_penalty     += np.random.uniform(4, 9) * factor * util
-            noise_floor_dbm += np.random.uniform(4, 9) * factor * util
-            cca_busy_frac    = float(np.clip(cca_busy_frac + 0.15*factor*util + 0.05*np.random.rand(), 0, 0.98))
-            phy_error_rate   = float(np.clip(phy_error_rate + 0.20*factor*util, 0, 0.9))
-            beacon_miss_rate = float(np.clip(beacon_miss_rate + 0.06*factor*util, 0, 1.0))
+            util = (0.4 + 0.5*load)
+            bump = np.random.uniform(7, 16) * reach * util
+            jam_penalty     += bump
+            noise_floor_dbm += bump * np.random.uniform(0.7, 1.0)
+            if cellular_mode:
+                phy_error_rate   = float(np.clip(phy_error_rate + 0.30*reach*util + 0.10*np.random.rand(), 0, 0.98))
+                assoc_churn      = float(np.clip(assoc_churn + 0.25*reach*util + 0.10*np.random.rand(), 0, 1.0))
+            else:
+                cca_busy_frac    = float(np.clip(cca_busy_frac + 0.18*reach*util + 0.07*np.random.rand(), 0, 0.98))
+                phy_error_rate   = float(np.clip(phy_error_rate + 0.28*reach*util, 0, 0.98))
         else:  # Mgmt (deauth)
-            deauth_rate      = float(np.clip(deauth_rate + 0.40*factor + 0.20*np.random.rand(), 0, 1.0))
-            assoc_churn      = float(np.clip(assoc_churn + 0.35*factor + 0.15*np.random.rand(), 0, 1.0))
-            beacon_miss_rate = float(np.clip(beacon_miss_rate + 0.12*factor, 0, 1.0))
-            jam_penalty     += np.random.uniform(0, 3) * factor
+            if st.session_state.get("cellular_mode", False):
+                assoc_churn      = float(np.clip(assoc_churn + 0.40*reach + 0.15*np.random.rand(), 0, 1.0))
+                phy_error_rate   = float(np.clip(phy_error_rate + 0.12*reach, 0, 0.95))
+            else:
+                deauth_rate      = float(np.clip(deauth_rate + 0.45*reach + 0.20*np.random.rand(), 0, 1.0))
+                assoc_churn      = float(np.clip(assoc_churn + 0.35*reach + 0.15*np.random.rand(), 0, 1.0))
+                beacon_miss_rate = float(np.clip(beacon_miss_rate + 0.12*reach, 0, 1.0))
 
     snr = max(0.0, base_snr - jam_penalty)
-
-    # Packet loss as logistic of SNR + congestion
-    cong = 0.15*load
-    loss = 1/(1+np.exp(0.4*(snr-15))) + cong + np.random.normal(0, 0.02)
-    loss = float(np.clip(loss*100, 0, 90))
-
-    # Latency & jitter
-    latency = 20 + 2.0*loss + 30*load + np.random.normal(0, 6)
-    jitter  = 1.0 + 0.05*loss + 8*load + np.random.normal(0, 1.0)
-    latency = float(max(3, latency)); jitter = float(max(0.2, jitter))
-
-    # Throughput & channel util
-    thr = float(max(1, 90 - 0.8*loss - 40*load + np.random.normal(0, 5)))
+    # Stronger downstream effects from lower SNR
+    loss = 1/(1+np.exp(0.35*(snr-18))) + 0.18*load + np.random.normal(0, 0.02)
+    loss = float(np.clip(loss*100, 0, 95))
+    latency = float(max(5, 18 + 2.2*loss + 28*load + np.random.normal(0, 7)))
+    jitter  = float(max(0.3, 1.2 + 0.06*loss + 9*load + np.random.normal(0, 1.3)))
+    thr     = float(max(0.5, 95 - 0.9*loss - 45*load + np.random.normal(0, 6)))
     channel_util = float(np.clip(100*(0.4+0.5*load) + 100*(cca_busy_frac-0.15) + np.random.normal(0, 5), 0, 100))
 
     # Auth baseline & CRC baseline
@@ -462,8 +478,12 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
                     eapol_retry_rate = float(np.clip(eapol_retry_rate + np.random.uniform(0.35, 0.70), 0, 1.0))
                     auth_fail        += np.random.uniform(0.4, 0.9)
 
-    # GPS spoofing realism (training path handled later)
+    # --- GNSS baselines ---
     pos_error = np.random.normal(2.0, 0.7)
+    gnss_sats = int(np.clip(np.random.normal(11, 2.0), 5, 18))         # typical 8–14
+    gnss_hdop = float(np.clip(np.random.normal(1.0, 0.25), 0.6, 2.5))  # lower is better
+    gnss_doppler_var = float(np.clip(np.random.normal(3.0, 0.8), 0.5, 8.0))
+    gnss_clk_drift_ppm = float(np.clip(np.random.normal(0.10, 0.05), 0.0, 0.5))
 
     # ---------- Data Tamper realism ----------
     if "seq_counter" not in st.session_state:
@@ -509,14 +529,24 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
             schema_violation_rate += float(np.random.uniform(0.30, 0.70))
             payload_entropy = float(np.random.uniform(4.5, 6.0))
 
+    # ---------- Training-time GPS spoofing ----------
     if str(scen).startswith("GPS Spoofing") and training:
         minutes = tick / 60.0
-        bias = 20.0
-        drift = 6.0 * minutes
-        pos_error += np.random.uniform(0.6*bias, 1.2*bias) + 0.5*drift
+        bias = 30.0
+        drift = 8.0 * minutes
+        pos_error += np.random.uniform(0.6*bias, 1.2*bias) + 0.6*drift
+
+        # GNSS inconsistencies
+        if np.random.rand() < 0.5:
+            gnss_hdop = float(np.random.uniform(0.25, 0.5))   # too good while pos bad
+        else:
+            gnss_hdop = float(np.random.uniform(2.5, 4.0))    # poor geometry
+        gnss_sats = int(np.random.randint(4, 8))              # suspiciously low
+        gnss_doppler_var = float(np.random.uniform(4.5, 9.5)) # inconsistent residuals
+        gnss_clk_drift_ppm = float(np.random.uniform(0.5, 1.5))
 
     return dict(
-        rssi=float(rssi), snr=float(max(0.0, base_snr - jam_penalty)),
+        rssi=float(rssi), snr=float(snr),
         packet_loss=float(loss), latency_ms=float(latency), jitter_ms=float(jitter),
         pos_error_m=float(max(0.3, pos_error)),
         auth_fail_rate=float(max(0, auth_fail)),
@@ -536,7 +566,12 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
         seq_gap=float(np.clip(seq_gap, 0.0, 1.0)),
         dup_ratio=float(np.clip(dup_ratio, 0.0, 1.0)),
         schema_violation_rate=float(np.clip(schema_violation_rate, 0.0, 1.0)),
-        hmac_fail_rate=float(np.clip(hmac_fail_rate, 0.0, 1.0))
+        hmac_fail_rate=float(np.clip(hmac_fail_rate, 0.0, 1.0)),
+        # GNSS
+        gnss_sats=int(gnss_sats),
+        gnss_hdop=float(gnss_hdop),
+        gnss_doppler_var=float(gnss_doppler_var),
+        gnss_clk_drift_ppm=float(gnss_clk_drift_ppm)
     )
 
 # =========================
@@ -756,7 +791,7 @@ def tick_once():
             breach_mode=st.session_state.get("breach_mode")
         )
 
-        # Live GPS spoofing effect
+        # Live GPS spoofing effect (aligned with training)
         if scenario.startswith("GPS Spoofing"):
             spf = st.session_state.spoofer
             d_spf = haversine_m(row.lat, row.lon, spf["lat"], spf["lon"])
@@ -767,10 +802,19 @@ def tick_once():
                   (scope=="Localized area" and d_spf <= CFG.spoof_radius_m)
             if hit and (not mobile_only or row.type in MOBILE_TYPES):
                 minutes = tick / 60.0
-                bias = 20.0
-                drift = 6.0 * minutes
-                scale = 1.0 if scope!="Localized area" else max(0.15, 1.0 - d_spf/CFG.spoof_radius_m)
-                m["pos_error_m"] += scale * (np.random.uniform(0.6*bias, 1.2*bias) + 0.5*drift)
+                bias = 30.0
+                drift = 8.0 * minutes
+                scale = 1.0 if scope!="Localized area" else max(0.20, 1.0 - d_spf/CFG.spoof_radius_m)
+                m["pos_error_m"] += scale * (np.random.uniform(0.6*bias, 1.2*bias) + 0.6*drift)
+
+                # Inject GNSS inconsistencies in live path too
+                if np.random.rand() < 0.5:
+                    m["gnss_hdop"] = float(np.random.uniform(0.25, 0.5))
+                else:
+                    m["gnss_hdop"] = float(np.random.uniform(2.5, 4.0))
+                m["gnss_sats"] = int(np.random.randint(4, 8))
+                m["gnss_doppler_var"] = float(np.random.uniform(4.5, 9.5))
+                m["gnss_clk_drift_ppm"] = float(np.random.uniform(0.5, 1.5))
 
         st.session_state.dev_buf[row.device_id].append(m)
         rec = {"tick":tick, "device_id":row.device_id, "type":row.type, "lat":row.lat, "lon":row.lon, **m}
@@ -795,7 +839,8 @@ def tick_once():
 
         idx_alert = np.where(probs >= CFG.threshold)[0]
         if len(idx_alert)>0:
-            shap_vals = shap_pos(st.session_state.explainer, to_df(Xs, X.columns).iloc[idx_alert])
+            expl_inputs = to_df(Xs, X.columns).iloc[idx_alert]
+            shap_vals = shap_pos(st.session_state.explainer, expl_inputs)
             shap_arr = np.array(shap_vals)
             if shap_arr.ndim == 1:
                 shap_arr = shap_arr[:, None]
@@ -892,15 +937,15 @@ with k5:
     st.metric("Last train duration", f"{int(train_secs)}s" if train_secs else "—")
 
 # =========================
-# SHAP renderer for incidents (snapshot)
+# SHAP renderer for incidents (snapshot) — SCOPED KEYS
 # =========================
-def render_device_inspector_from_incident(inc, topk=8):
+def render_device_inspector_from_incident(inc, topk=8, scope="main"):
     feats = inc.get("features") or st.session_state.last_features.get(inc["device_id"])
     if not feats:
         st.info("Not enough samples for device window yet.")
         return
 
-    base_key = f"{inc['device_id']}_{inc['ts']}_{inc['tick']}"
+    base_key = f"{incident_id(inc)}_{scope}"
 
     X = pd.DataFrame([feats]).fillna(0.0)
     Xs = st.session_state.scaler.transform(X)
@@ -917,7 +962,7 @@ def render_device_inspector_from_incident(inc, topk=8):
             'threshold': {'line': {'color': "red", 'width': 3}, 'thickness': 0.8, 'value': CFG.threshold*100}
         }
     ))
-    st.plotly_chart(gauge, use_container_width=True, key=f"gauge_{base_key}")
+    st.plotly_chart(gauge, width="stretch", key=f"gauge_{base_key}")
 
     # Top SHAP contributions
     shap_vec = shap_pos(st.session_state.explainer, Xs_df)[0]
@@ -926,20 +971,20 @@ def render_device_inspector_from_incident(inc, topk=8):
     fig = px.bar(df_shap.sort_values("impact"), x="impact", y="feature", orientation="h",
                  title=f"Top local contributions — {inc['device_id']}",
                  labels={"impact": "contribution → anomaly"})
-    st.plotly_chart(fig, use_container_width=True, key=f"local_shap_{base_key}")
+    st.plotly_chart(fig, width="stretch", key=f"local_shap_{base_key}")
 
     # Mini history (last window)
     hist = get_device_history(inc["device_id"], ["snr","packet_loss","latency_ms","pos_error_m"])
     if len(hist)>0:
         hist = hist.reset_index(drop=True)
         c1,c2 = st.columns(2)
-        c1.plotly_chart(px.line(hist, y="snr", title="SNR (last window)"), use_container_width=True, key=f"hist_snr_{base_key}")
-        c1.plotly_chart(px.line(hist, y="packet_loss", title="Packet loss % (last window)"), use_container_width=True, key=f"hist_loss_{base_key}")
-        c2.plotly_chart(px.line(hist, y="latency_ms", title="Latency ms (last window)"), use_container_width=True, key=f"hist_latency_{base_key}")
-        c2.plotly_chart(px.line(hist, y="pos_error_m", title="GNSS error m (last window)"), use_container_width=True, key=f"hist_gnss_{base_key}")
+        c1.plotly_chart(px.line(hist, y="snr", title="SNR (last window)"), width="stretch", key=f"hist_snr_{base_key}")
+        c1.plotly_chart(px.line(hist, y="packet_loss", title="Packet loss % (last window)"), width="stretch", key=f"hist_loss_{base_key}")
+        c2.plotly_chart(px.line(hist, y="latency_ms", title="Latency ms (last window)"), width="stretch", key=f"hist_latency_{base_key}")
+        c2.plotly_chart(px.line(hist, y="pos_error_m", title="GNSS error m (last window)"), width="stretch", key=f"hist_gnss_{base_key}")
 
     with st.expander("Raw window features (standardized input)"):
-        st.dataframe(Xs_df.T.rename(columns={0: "z-value"}), use_container_width=True)
+        st.dataframe(Xs_df.T.rename(columns={0: "z-value"}))
 
 # =========================
 # Role-aware incident rendering & categorization
@@ -951,10 +996,9 @@ def incident_category(inc):
             return cat
     return "Other"
 
-def render_incident_body_for_role(inc, role):
-    base_key = incident_id(inc)
-    pv = inc.get("p_value")
-    pv_str = f"{pv:.3f}" if pv is not None else "—"
+def render_incident_body_for_role(inc, role, scope="main"):
+    base_key = f"{incident_id(inc)}_{scope}"
+    pv = inc.get("p_value"); pv_str = f"{pv:.3f}" if pv is not None else "—"
     sev = inc.get("severity", "—")
     cols = st.columns(3)
     cols[0].metric("Severity", sev)
@@ -985,13 +1029,13 @@ def render_incident_body_for_role(inc, role):
     elif role == "Domain Expert":
         st.markdown("**Operational signals**")
         if "Jamming" in inc["scenario"]:
-            st.write("↑ noise_floor_dbm, ↑ cca_busy_frac, ↑ phy_error_rate, ↑ beacon_miss_rate, ↓ snr")
+            st.write("↑ noise_floor_dbm, ↑ phy_error_rate/BLER, ↑ assoc_churn, ↓ snr")
         elif "Access Breach" in inc["scenario"]:
             st.write("↑ deauth_rate, ↑ assoc_churn, ↑ eapol_retry_rate / dhcp_fail_rate, rogue_rssi_gap>0")
         elif "Data Tamper" in inc["scenario"]:
             st.write("↑ dup_ratio, ↑ ts_skew_s, ↑ schema_violation_rate, ↑ hmac_fail_rate (if enabled)")
         elif "GPS Spoofing" in inc["scenario"]:
-            st.write("↑ pos_error_m with smooth bias/drift")
+            st.write("↑ pos_error_m with odd GNSS: hdop, sats, Doppler var, clock drift")
 
         st.markdown("**Playbook**")
         if "Jamming" in inc["scenario"]:
@@ -1004,7 +1048,7 @@ def render_incident_body_for_role(inc, role):
             st.write("GNSS-denied nav ▸ Verify time source ▸ Geofence sanity.")
 
         with st.expander("Device Inspector (local SHAP)"):
-            render_device_inspector_from_incident(inc, topk=8)
+            render_device_inspector_from_incident(inc, topk=8, scope=scope)
 
     elif role == "Regulator":
         st.markdown("**Assurance & governance**")
@@ -1013,7 +1057,7 @@ def render_incident_body_for_role(inc, role):
         evidence = {
             "ts": inc["ts"], "tick": inc["tick"], "device_id": inc["device_id"], "type": inc["type"],
             "lat": inc["lat"], "lon": inc["lon"], "scenario": inc["scenario"], "severity": inc["severity"],
-            "prob": inc["prob"], "p_value": inc["p_value"], "model_version": "LightGBM v2.6-demo",
+            "prob": inc["prob"], "p_value": inc["p_value"], "model_version": "LightGBM v2.7-demo",
             "explanations": inc["reasons"]
         }
         st.download_button(
@@ -1026,14 +1070,14 @@ def render_incident_body_for_role(inc, role):
 
     elif role == "AI Builder":
         st.markdown("**Model view**")
-        render_device_inspector_from_incident(inc, topk=8)
+        render_device_inspector_from_incident(inc, topk=8, scope=scope)
         with st.expander("Standardized feature vector (z-values)"):
             feats = inc.get("features") or st.session_state.last_features.get(inc["device_id"])
             if feats:
                 X = pd.DataFrame([feats]).fillna(0.0)
                 Xs = st.session_state.scaler.transform(X)
                 Xs_df = pd.DataFrame(Xs, columns=X.columns)
-                st.dataframe(Xs_df.T.rename(columns={0:"z"}), use_container_width=True)
+                st.dataframe(Xs_df.T.rename(columns={0:"z"}))
 
     else:  # Executive
         st.markdown("**Executive summary**")
@@ -1042,8 +1086,8 @@ def render_incident_body_for_role(inc, role):
         st.markdown("**KPIs**")
         st.write("- Incidents, MTTD, Packet loss, Latency, SNR, Deauth rate")
 
-def render_incident_card(inc, role):
-    base_key = incident_id(inc)
+def render_incident_card(inc, role, scope="main"):
+    base_key = f"{incident_id(inc)}_{scope}"
     pv = inc.get("p_value"); pv_str = f"{pv:.3f}" if pv is not None else "—"
     sev = inc.get("severity", "—")
     color = {"High":"red","Medium":"orange","Low":"green"}.get(sev, "gray")
@@ -1072,7 +1116,7 @@ def render_incident_card(inc, role):
             st.caption(f"Label: **{tag}** (human oversight)")
 
         with st.expander("Details"):
-            render_incident_body_for_role(inc, role)
+            render_incident_body_for_role(inc, role, scope=scope)
 
     with cols[1]:
         st.json({k: inc[k] for k in ["tick","device_id","type","prob","p_value"]})
@@ -1198,7 +1242,7 @@ with tab_overview:
             tooltip = {"html": "<b>{device_id}</b> • {type}<br/>Risk: {risk}<br/>SNR: {snr} dB<br/>Loss: {packet_loss}%",
                        "style": {"backgroundColor": "rgba(255,255,255,0.95)", "color": "#111"}}
             st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view_state, map_style=None, tooltip=tooltip),
-                            use_container_width=True)
+                            width="stretch")
 
             st.markdown(
                 """
@@ -1227,7 +1271,7 @@ with tab_overview:
             for y in ["snr","packet_loss","latency_ms","pos_error_m"]:
                 sub = fr.groupby("tick")[y].mean().reset_index()
                 fig=px.line(sub, x="tick", y=y, title=f"Fleet avg {y}")
-                st.plotly_chart(fig, use_container_width=True, key=f"overview_{y}")
+                st.plotly_chart(fig, width="stretch", key=f"overview_{y}")
                 if y == "snr" and help_mode:
                     st.caption("**Fleet avg SNR**: mean link quality; <10 dB shaky; >20 dB healthy.")
 
@@ -1242,7 +1286,7 @@ with tab_overview:
         if leaderboard:
             df_lead=pd.DataFrame(leaderboard).sort_values("prob",ascending=False).head(10)
             st.markdown("### Top risk devices")
-            st.dataframe(df_lead, use_container_width=True)
+            st.dataframe(df_lead)
 
 # ---------- Fleet View
 with tab_fleet:
@@ -1256,8 +1300,8 @@ with tab_fleet:
         z = (mat-mat.mean())/mat.std(ddof=0).replace(0,1)
         fig = px.imshow(z.T, color_continuous_scale="RdBu_r", aspect="auto",
                         labels=dict(color="z-score"), title="Fleet heatmap (recent mean z-scores)")
-        st.plotly_chart(fig, use_container_width=True, key="fleet_heatmap")
-    st.dataframe(st.session_state.devices, use_container_width=True)
+        st.plotly_chart(fig, width="stretch", key="fleet_heatmap")
+    st.dataframe(st.session_state.devices)
 
 # ---------- Incidents
 with tab_incidents:
@@ -1285,7 +1329,7 @@ with tab_incidents:
                                          default=["High","Medium","Low"], key=f"sev_{c}")
                 for inc in cat_map[c]:
                     if inc["severity"] in sev_sel:
-                        render_incident_card(inc, role)
+                        render_incident_card(inc, role, scope=f"cat_{c}")
 
         # 'All' tab
         with tabs[-1]:
@@ -1293,7 +1337,7 @@ with tab_incidents:
                                          default=["High","Medium","Low"], key="sev_all_tabs")
             for inc in all_inc:
                 if inc["severity"] in sev_sel_all:
-                    render_incident_card(inc, role)
+                    render_incident_card(inc, role, scope="all")
 
     if st.session_state.incidents:
         df_inc = pd.DataFrame(st.session_state.incidents)
@@ -1314,7 +1358,7 @@ with tab_insights:
             imp = pd.DataFrame({"feature": base.columns, "mean_abs_shap": mean_abs}).sort_values("mean_abs_shap", ascending=False).head(18)
             fig = px.bar(imp, x="mean_abs_shap", y="feature", orientation="h",
                          title="Global feature impact — bigger bars = more influence")
-            st.plotly_chart(fig, use_container_width=True, key=f"global_importance_{nonce}")
+            st.plotly_chart(fig, width="stretch", key=f"global_importance_{nonce}")
             if help_mode:
                 st.caption("**Global importance (mean |SHAP|)**: average absolute contribution across many samples—bigger bars = more influential.")
 
@@ -1335,7 +1379,7 @@ with tab_insights:
             fig = px.line(df_rel, x="confidence", y="empirical",
                           title=f"Reliability (Brier {ev.get('brier', np.nan):.3f}) — closer to diagonal is better")
             fig.add_scatter(x=[0,1], y=[0,1], mode="lines", name="perfect")
-            st.plotly_chart(fig, use_container_width=True, key=f"calibration_curve_{nonce}")
+            st.plotly_chart(fig, width="stretch", key=f"calibration_curve_{nonce}")
             if help_mode:
                 st.caption("**Calibration reliability**: predicted vs actual frequencies; closer to diagonal is better. **Brier score** lower is better.")
         else:
