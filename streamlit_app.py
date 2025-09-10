@@ -95,7 +95,6 @@ with st.sidebar:
         breach_mode = st.radio("Breach mode", ["Evil Twin", "Rogue Open AP", "Credential hammer"], index=0, key="breach_mode")
         CFG.breach_radius_m = st.slider("Rogue AP lure radius (m)", 50, 300, CFG.breach_radius_m, 10, key="breach_radius")
     if scenario.startswith("GPS Spoofing"):
-        # FIX: do NOT assign back into st.session_state after widget creation
         st.radio("Spoofing scope", ["Single device", "Localized area", "Site-wide"], index=1, key="spoof_mode")
         st.checkbox("Affect mobile (AMR/Truck) only", True, key="spoof_mobile_only")
         CFG.spoof_radius_m = st.slider("Spoof coverage (m)", 50, 500, CFG.spoof_radius_m, 10, key="spoof_radius")
@@ -666,7 +665,9 @@ def tick_once():
             inc = dict(
                 ts=int(time.time()), tick=tick, device_id=row.device_id, type=row.type,
                 lat=row.lat, lon=row.lon, scenario=scenario,
-                prob=prob, p_value=pval, severity=sev, reasons=[{"feature":k,"impact":float(v)} for k,v in pairs]
+                prob=prob, p_value=pval, severity=sev,
+                features=feats,  # snapshot for per-incident Device Inspector
+                reasons=[{"feature":k,"impact":float(v)} for k,v in pairs]
             )
             st.session_state.incidents.append(inc)
             incidents_this_tick.append(inc)
@@ -712,6 +713,34 @@ with k4:
 with k5:
     train_secs = st.session_state.get("last_train_secs")
     st.metric("Last train duration", f"{int(train_secs)}s" if train_secs else "—")
+
+# =========================
+# SHAP renderer to reuse in incidents
+# =========================
+def render_device_inspector_from_incident(inc, topk=8):
+    feats = inc.get("features") or st.session_state.last_features.get(inc["device_id"])
+    if not feats:
+        st.info("Not enough samples for device window yet.")
+        return
+    X = pd.DataFrame([feats]).fillna(0.0)
+    Xs = st.session_state.scaler.transform(X)
+    Xs_df = to_df(Xs, X.columns)
+    prob = float(st.session_state.model.predict_proba(Xs_df)[:, 1][0])
+    pval = conformal_pvalue(prob) if st.session_state.get("conformal_scores") is not None else None
+
+    c1, c2 = st.columns(2)
+    with c1: st.metric("Current risk (prob)", f"{prob:.2f}")
+    with c2: st.metric("Conf. p-value", f"{(pval if pval is None else round(pval,3)) if pval is not None else '—'}")
+
+    shap_vec = shap_pos(st.session_state.explainer, Xs_df)[0]
+    pairs = sorted(zip(X.columns, shap_vec), key=lambda kv: abs(kv[1]), reverse=True)[:topk]
+    df_shap = pd.DataFrame(pairs, columns=["feature", "impact"])
+    fig = px.bar(df_shap.sort_values("impact"), x="impact", y="feature", orientation="h",
+                 title=f"Local SHAP — {inc['device_id']}", labels={"impact": "contribution → anomaly"})
+    st.plotly_chart(fig, width='stretch')
+
+    with st.expander("Raw window features (standardized input)"):
+        st.dataframe(Xs_df.T.rename(columns={0: "z-value"}), use_container_width=True)
 
 # =========================
 # Layout tabs
@@ -898,39 +927,7 @@ with tab_overview:
             st.markdown("### Top risk devices")
             st.dataframe(df_lead, use_container_width=True)
 
-        st.markdown("### Device Inspector (local SHAP)")
-        if role in {"Domain Expert", "AI Builder", "Executive"} and st.session_state.get("model") is not None:
-            have_feats = [d for d in st.session_state.devices["device_id"].tolist()
-                          if d in st.session_state.last_features]
-            options = have_feats if have_feats else st.session_state.devices["device_id"].tolist()
-            sel = st.selectbox("Select device", options, key="device_inspect_select")
-
-            feats = st.session_state.last_features.get(sel)
-            if feats:
-                X = pd.DataFrame([feats]).fillna(0.0)
-                Xs = st.session_state.scaler.transform(X)
-                Xs_df = to_df(Xs, X.columns)
-                prob = float(st.session_state.model.predict_proba(Xs_df)[:, 1][0])
-                pval = conformal_pvalue(prob) if use_conformal else None
-
-                c1, c2 = st.columns(2)
-                with c1: st.metric("Current risk (prob)", f"{prob:.2f}")
-                with c2: st.metric("Conf. p-value", f"{pval:.3f}" if pval is not None else "—")
-
-                shap_vec = shap_pos(st.session_state.explainer, Xs_df)[0]
-                topk = 8
-                pairs = sorted(zip(X.columns, shap_vec), key=lambda kv: abs(kv[1]), reverse=True)[:topk]
-                df_shap = pd.DataFrame(pairs, columns=["feature", "impact"])
-                fig = px.bar(df_shap.sort_values("impact"), x="impact", y="feature", orientation="h",
-                             title=f"Local SHAP — {sel}", labels={"impact": "contribution → anomaly"})
-                st.plotly_chart(fig, width='stretch')
-
-                with st.expander("Raw window features (standardized input)"):
-                    st.dataframe(Xs_df.T.rename(columns={0: "z-value"}), use_container_width=True)
-            else:
-                st.info("Waiting for enough samples to build a feature window for this device.")
-        else:
-            st.caption("Local SHAP hidden for this role. Switch to Domain Expert / AI Builder / Executive to view.")
+        st.caption("Device-level explanations are now embedded within each incident below.")
 
 # ---------- Fleet View
 with tab_fleet:
@@ -1032,14 +1029,9 @@ with tab_incidents:
                         )
 
                     with tabs[3]:
-                        st.markdown("#### Local technical explanation (SHAP)")
-                        txt="\n".join([f"- {r['feature']}: {r['impact']:+.3f}" for r in inc["reasons"]])
-                        st.markdown(txt)
-                        st.caption("Positive impact pushes toward 'anomaly' in standardized feature space.")
-                        st.markdown("#### Implementation")
-                        st.write("- LightGBM (depth≤3, ~60 trees) on rolling-window features.")
-                        st.write("- Conformal calibration for p-values.")
-                        st.write("- Realistic RF & Wi-Fi signals; integrity/freshness fields for tamper.")
+                        st.markdown("#### Device Inspector (local SHAP)")
+                        render_device_inspector_from_incident(inc, topk=8)
+                        st.caption("Positive impact increases anomaly score in standardized feature space.")
 
                     with tabs[4]:
                         st.markdown("#### Executive summary")
@@ -1100,5 +1092,5 @@ with tab_insights:
             "Synthetic but physics-inspired; not production-ready",
             "Single-site example without true multi-AP roaming"
         ],
-        "version": "v2.3-sundsvall"
+        "version": "v2.4-sundsvall"
     })
