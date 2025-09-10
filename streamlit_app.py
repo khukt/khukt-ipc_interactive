@@ -56,7 +56,9 @@ class Config:
     retrain_on_start: bool = True
 
 CFG = Config()
-TYPE_TAU = 0.55  # type classifier abstains if below this prob
+
+# Softer type-confidence threshold + low-conf fallback
+TYPE_TAU = 0.50  # type classifier abstains if below this prob
 
 RAW_FEATURES = [
     # RF/QoS (common)
@@ -323,14 +325,13 @@ def model_card_data():
         "limitations": [
             "Synthetic, physics-inspired signals",
             "Single-site example; not production-ready"
-        ]
-    }
-    # Add type classifier card
-    mc["type_classifier"] = {
-        "model": "DecisionTree (max_depth=4, class_weight=balanced)",
-        "accuracy_est": st.session_state.get("type_metrics", {}).get("accuracy", None),
-        "classes": st.session_state.get("type_metrics", {}).get("classes", []),
-        "abstain_threshold": TYPE_TAU
+        ],
+        "type_classifier": {
+            "model": "DecisionTree (max_depth=4, class_weight=balanced)",
+            "accuracy_est": st.session_state.get("type_metrics", {}).get("accuracy", None),
+            "classes": st.session_state.get("type_metrics", {}).get("classes", []),
+            "abstain_threshold": TYPE_TAU
+        }
     }
     return mc
 
@@ -342,8 +343,30 @@ def data_schema_json():
         "notes": "Synthetic signals only; no personal data. Export for transparency."
     }
 
+# ---- JSON sanitizer (handles numpy/pandas types) ----
+def _to_builtin(o):
+    import numpy as _np
+    import pandas as _pd
+
+    if isinstance(o, dict):
+        return {str(k): _to_builtin(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple, set)):
+        return [_to_builtin(v) for v in o]
+    if isinstance(o, (_np.integer,)):
+        return int(o)
+    if isinstance(o, (_np.floating,)):
+        return float(o)
+    if isinstance(o, (_np.bool_,)):
+        return bool(o)
+    if isinstance(o, (_np.ndarray,)):
+        return o.tolist()
+    if isinstance(o, (_pd.Timestamp,)):
+        return o.isoformat()
+    return o
+
 def audit_log_json():
-    return {"incidents": st.session_state.get("incidents", [])}
+    raw = {"incidents": st.session_state.get("incidents", [])}
+    return _to_builtin(raw)
 
 # =========================
 # Session init
@@ -435,9 +458,7 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
     if jam_mode is None: jam_mode = st.session_state.get("jam_mode")
     if breach_mode is None: breach_mode = st.session_state.get("breach_mode")
 
-    if training:
-        st.session_state["cellular_mode"] = (row.type in {"Truck","Gateway"})
-
+    # (Removed training-time flip of cellular_mode)
     cellular_mode = st.session_state.get("cellular_mode", False)
 
     ap   = st.session_state.ap
@@ -773,14 +794,15 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
     X_cal,X_test,y_cal,y_test,lab_cal,lab_test = train_test_split(X_tmp,y_tmp,lab_tmp,test_size=0.50,random_state=SEED,shuffle=True,stratify=y_tmp)
     return (X_train,y_train,lab_train),(X_cal,y_cal,lab_cal),(X_test,y_test,lab_test),X,labels
 
-def _select_type_bases(cellular_mode: bool):
+# Union of bases (Wi-Fi + Cellular) so type-head is profile-robust
+def _select_type_bases():
     wifi_jam   = ["snr","noise_floor_dbm","phy_error_rate","cca_busy_frac","packet_loss","latency_ms","jitter_ms"]
     cell_jam   = ["sinr_db","rsrp_dbm","rsrq_db","bler","harq_nack_ratio","assoc_churn","packet_loss","latency_ms"]
     breach     = ["deauth_rate","assoc_churn","eapol_retry_rate","dhcp_fail_rate","rogue_rssi_gap","beacon_miss_rate","attach_reject_rate","pci_anomaly"]
     spoof      = ["pos_error_m","gnss_hdop","gnss_sats","gnss_doppler_var","gnss_clk_drift_ppm","cno_mean_dbhz","cno_std_dbhz"]
     tamper     = ["hmac_fail_rate","dup_ratio","seq_gap","ts_skew_s","schema_violation_rate","payload_entropy","crc_err"]
-    bases = set(spoof + tamper + breach + (cell_jam if st.session_state.get("cellular_mode", False) else wifi_jam))
-    return list(bases)
+    bases = set(wifi_jam + cell_jam + breach + spoof + tamper)
+    return sorted(list(bases))
 
 def _cols_from_bases(all_cols, bases):
     return [c for c in all_cols if any(c.startswith(f"{b}_") for b in bases)]
@@ -848,7 +870,7 @@ def train_model_with_progress(n_ticks=350):
     update(95, "Training attack type classifier…")
     pos_mask = labels_all != "Normal"
     if np.any(pos_mask):
-        bases = _select_type_bases(st.session_state.get("cellular_mode", False))
+        bases = _select_type_bases()  # union of bases
         type_cols = _cols_from_bases(cols, bases)
         X_pos = to_df(Xall[:, [cols.index(c) for c in type_cols]], type_cols)[pos_mask]
         y_pos = labels_all[pos_mask]
@@ -946,7 +968,7 @@ def tick_once():
                     m["cno_mean_dbhz"] = float(np.random.uniform(28, 34)); m["cno_std_dbhz"] = float(np.random.uniform(3.0, 6.0))
 
         st.session_state.dev_buf[row.device_id].append(m)
-        rec = {"tick":tick, "device_id":row.device_id, "type":row.type, "lat":row.lat, "lon":row.lon, **m}
+        rec = {"tick":int(tick), "device_id":row.device_id, "type":row.type, "lat":float(row.lat), "lon":float(row.lon), **m}
         fleet_rows.append(rec)
 
     device_ids=[]; feats_list=[]
@@ -978,36 +1000,43 @@ def tick_once():
                 did = device_ids[idx]
                 row = st.session_state.devices[st.session_state.devices["device_id"]==did].iloc[0]
                 prob = float(probs[idx])
-                pval = conformal_pvalue(prob) if st.session_state.get("conformal_scores") is not None else None
+                pval = conformal_pvalue(prob) if (use_conformal and st.session_state.get("conformal_scores") is not None) else None
                 sev,_ = severity(prob, pval)
                 shap_vec = shap_arr[j]
                 pairs = sorted(list(zip(X.columns, shap_vec)), key=lambda kv: abs(kv[1]), reverse=True)[:6]
 
-                # Stage-2 type classification (if available)
+                # Stage-2 type classification (robust + fallback)
                 type_label = "Unknown"; type_conf = None; type_pairs=[]
                 if st.session_state.get("type_clf") is not None:
-                    tcols = st.session_state.type_cols
-                    xrow = to_df(Xs, X.columns).iloc[[idx]][tcols]
+                    tcols_all = st.session_state.type_cols
+                    tcols = [c for c in tcols_all if c in X.columns]
+                    xrow_full = to_df(Xs, X.columns).iloc[[idx]]
+                    xrow = xrow_full[tcols] if tcols else xrow_full
+
                     probs_type = st.session_state.type_clf.predict_proba(xrow)[0]
                     best_idx = int(np.argmax(probs_type))
-                    type_conf = float(probs_type[best_idx])
-                    if type_conf >= TYPE_TAU:
-                        type_label = st.session_state.type_clf.classes_[best_idx]
+                    best_p = float(probs_type[best_idx])
+                    raw_label = st.session_state.type_clf.classes_[best_idx]
+
+                    if best_p >= TYPE_TAU:
+                        type_label, type_conf = raw_label, best_p
+                    elif best_p >= 0.40:
+                        type_label, type_conf = f"{raw_label} (low conf)", best_p
+                    else:
+                        type_label, type_conf = "Unknown", best_p
+
                     # explain type decision
                     try:
                         tvals = st.session_state.type_explainer.shap_values(xrow)
-                        if isinstance(tvals, list):
-                            tv = tvals[best_idx][0]
-                        else:
-                            tv = tvals[0]
+                        tv = tvals[best_idx][0] if isinstance(tvals, list) else tvals[0]
                         type_pairs = sorted(list(zip(xrow.columns, tv)), key=lambda kv: abs(kv[1]), reverse=True)[:6]
                     except Exception:
                         type_pairs=[]
 
                 inc = dict(
-                    ts=int(time.time()), tick=tick,
-                    device_id=did, type=row.type, lat=row.lat, lon=row.lon,
-                    scenario=scenario, prob=prob, p_value=pval, severity=sev,
+                    ts=int(time.time()), tick=int(tick),
+                    device_id=did, type=row.type, lat=float(row.lat), lon=float(row.lon),
+                    scenario=scenario, prob=float(prob), p_value=(None if pval is None else float(pval)), severity=sev,
                     features=st.session_state.last_features[did],
                     reasons=[{"feature":k,"impact":float(v)} for k,v in pairs],
                     type_label=type_label, type_conf=type_conf,
@@ -1021,8 +1050,8 @@ def tick_once():
         ratio = len(affected)/len(st.session_state.devices)
         if ratio>=0.25:
             st.session_state.group_incidents.append({
-                "ts": int(time.time()), "tick": tick, "scenario": scenario,
-                "affected": len(affected), "fleet": len(st.session_state.devices), "ratio": ratio,
+                "ts": int(time.time()), "tick": int(tick), "scenario": scenario,
+                "affected": int(len(affected)), "fleet": int(len(st.session_state.devices)), "ratio": float(ratio),
             })
 
     st.session_state.fleet_records.extend(fleet_rows)
@@ -1244,7 +1273,7 @@ def render_incident_body_for_role(inc, role, scope="main"):
         }
         st.download_button(
             "Download incident evidence (JSON)",
-            data=json.dumps(evidence, indent=2).encode("utf-8"),
+            data=json.dumps(_to_builtin(evidence), indent=2).encode("utf-8"),
             file_name=f"incident_{inc['device_id']}_{inc['ts']}_{inc['tick']}.json",
             mime="application/json",
             key=f"dl_evidence_{base_key}"
@@ -1541,102 +1570,4 @@ with tab_incidents:
 
 # ---------- Insights (unique keys via ui_nonce)
 with tab_insights:
-    nonce = st.session_state.ui_nonce
-    g1,g2 = st.columns(2)
-    with g1:
-        st.markdown("### Global importance (mean |SHAP|)")
-        base = st.session_state.get("baseline")
-        if base is not None and len(base)>0:
-            shap_mat = shap_pos(st.session_state.explainer, base)
-            mean_abs = np.abs(shap_mat).mean(axis=0)
-            imp = pd.DataFrame({"feature": base.columns, "mean_abs_shap": mean_abs}).sort_values("mean_abs_shap", ascending=False).head(18)
-            fig = px.bar(imp, x="mean_abs_shap", y="feature", orientation="h",
-                         title="Global feature impact — bigger bars = more influence")
-            st.plotly_chart(fig, use_container_width=True, key=f"global_importance_{nonce}")
-            if help_mode:
-                st.caption("**Global importance (mean |SHAP|)**: average absolute contribution across many samples—bigger bars = more influential.")
-
-    with g2:
-        st.markdown("### Calibration (reliability)")
-        ev = st.session_state.get("eval") or {}
-        if "te_p" in ev and "y_test" in ev:
-            te_p = np.array(ev["te_p"]); y_test = np.array(ev["y_test"])
-            bins = np.linspace(0.0, 1.0, 11)
-            inds = np.digitize(te_p, bins) - 1
-            bin_p, bin_y = [], []
-            for b in range(10):
-                msk = (inds==b)
-                if np.any(msk):
-                    bin_p.append(te_p[msk].mean())
-                    bin_y.append(y_test[msk].mean())
-            df_rel = pd.DataFrame({"confidence": bin_p, "empirical": bin_y})
-            fig = px.line(df_rel, x="confidence", y="empirical",
-                          title=f"Reliability (Brier {ev.get('brier', np.nan):.3f}) — closer to diagonal is better")
-            fig.add_scatter(x=[0,1], y=[0,1], mode="lines", name="perfect")
-            st.plotly_chart(fig, use_container_width=True, key=f"calibration_curve_{nonce}")
-            if help_mode:
-                st.caption("**Calibration reliability**: predicted vs actual frequencies; closer to diagonal is better. **Brier score** lower is better.")
-        else:
-            st.info("Train (or retrain) to view calibration.")
-
-    st.markdown("### Feature glossary")
-    st.table(pd.DataFrame({"Feature (base)": list(FEATURE_GLOSSARY.keys()),
-                           "Meaning": [FEATURE_GLOSSARY[k] for k in FEATURE_GLOSSARY]}))
-
-# ---------- Governance (EU AI Act transparency) — unique keys via ui_nonce
-with tab_governance:
-    nonce = st.session_state.ui_nonce
-    st.subheader("EU AI Act — Transparency & Governance (Demo)")
-
-    c1,c2,c3 = st.columns(3)
-    with c1:
-        st.success("✅ Data transparency")
-        st.success("✅ Model transparency")
-    with c2:
-        st.success("✅ Logging & evidence")
-        st.success("✅ Human oversight")
-    with c3:
-        st.info("ℹ️ Risk: Demonstration system (synthetic, non-production)")
-
-    if help_mode:
-        st.caption("This demo surfaces transparency artifacts inline to help stakeholders understand data, model, confidence, and controls. Not legal advice.")
-
-    st.markdown("### Data transparency")
-    st.write("- **Source**: synthetic telemetry (no personal data).")
-    st.write("- **Signals**: RF/network (e.g., SNR, loss), GNSS error, integrity checks.")
-    st.write("- **Retention**: incidents kept in session memory; export below.")
-    c = st.columns(2)
-    with c[0]:
-        st.download_button(
-            "Download data schema (JSON)",
-            data=json.dumps(data_schema_json(), indent=2).encode("utf-8"),
-            file_name="data_schema.json",
-            mime="application/json",
-            key=f"gov_dl_schema_json_{nonce}"
-        )
-    with c[1]:
-        if st.session_state.incidents:
-            st.download_button(
-                "Download audit log (incidents.json)",
-                data=json.dumps(audit_log_json(), indent=2).encode("utf-8"),
-                file_name="incidents_audit_log.json",
-                mime="application/json",
-                key=f"gov_dl_audit_json_{nonce}"
-            )
-        else:
-            st.caption("No incidents yet to export.")
-
-    st.markdown("### Model transparency")
-    mc = model_card_data()
-    st.json(mc, expanded=False)
-    st.download_button(
-        "Download model card (JSON)",
-        data=json.dumps(mc, indent=2).encode("utf-8"),
-        file_name="model_card.json",
-        mime="application/json",
-        key=f"gov_dl_model_card_{nonce}"
-    )
-
-    st.markdown("### Human oversight")
-    st.write("Every incident card has **Acknowledge** and **Mark false positive** controls.")
-    st.caption("These labels demonstrate human-in-the-loop review and are included in exported audit logs.")
+    nonce = st
