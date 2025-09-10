@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import shap
 import streamlit as st
 import pydeck as pdk
+import lightgbm as lgb
 from lightgbm import LGBMClassifier
 from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -51,7 +52,7 @@ MOBILE_TYPES = {"AGV", "Truck"}
 # =========================
 st.set_page_config(page_title="TRUST AI — Realistic Wireless Threat Demo", layout="wide")
 st.title("TRUST AI — Realistic Wireless Threat Detection (Multi-Device)")
-st.caption("Geospatial fleet • Physics-ish RF • LightGBM + SHAP + Conformal • Persona-based XAI")
+st.caption("Geospatial fleet • Physics-ish RF • LightGBM + SHAP + Conformal • Persona-based XAI • Live Training Progress + ETA")
 
 # Sidebar
 with st.sidebar:
@@ -73,8 +74,9 @@ with st.sidebar:
     st.subheader("Display")
     show_map = st.checkbox("Show geospatial map", True)
     show_heatmap = st.checkbox("Show fleet heatmap (metric z-scores)", True)
-    # Optional: quick type filter for visibility
     type_filter = st.multiselect("Show device types", DEVICE_TYPES, default=DEVICE_TYPES)
+    st.divider()
+    retrain = st.button("Retrain model now")
 
 # =========================
 # Helpers
@@ -116,6 +118,13 @@ def time_of_day_load(tick):
     # simple diurnal load pattern [0,1]
     return 0.5 + 0.5*math.sin((tick%600)/600*2*math.pi)
 
+def fmt_eta(seconds):
+    if seconds is None or not np.isfinite(seconds):
+        return "—"
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    return f"{m:02d}:{s:02d}"
+
 # =========================
 # Session init
 # =========================
@@ -155,6 +164,7 @@ def init_state():
     st.session_state.explainer = None
     st.session_state.conformal_scores = None
     st.session_state.metrics = {}
+    st.session_state.last_train_secs = None
 
 if "devices" not in st.session_state or reset:
     init_state()
@@ -268,10 +278,10 @@ def feature_cols():
     return cols
 
 # =========================
-# Train model (synthetic)
+# Training (with live progress & ETA)
 # =========================
-def make_training_data(n_ticks=400):
-    # Create a tiny site and devices to synthesize training windows
+def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
+    """Generate rolling-window training data with progress [pct_start..pct_end]."""
     lat0, lon0 = CFG.site_center
     ap_lat, ap_lon = rand_point_near(lat0, lon0, 50)
     jam_lat, jam_lon = rand_point_near(lat0, lon0, 100)
@@ -283,9 +293,9 @@ def make_training_data(n_ticks=400):
                          speed_mps=(np.random.uniform(0.5,2.5) if d_type in MOBILE_TYPES else 0.0),
                          heading=np.random.uniform(0,2*np.pi)))
     D=pd.DataFrame(devs)
-
     buf = {d: deque(maxlen=CFG.rolling_len) for d in D.device_id}
     X_rows=[]; y=[]
+    t0 = time.time()
     for t in range(n_ticks):
         scen = np.random.choice(["Normal","J","GPS","Breach","Tamper"],
                                 p=[0.55,0.15,0.10,0.10,0.10])
@@ -312,13 +322,34 @@ def make_training_data(n_ticks=400):
             if feats:
                 X_rows.append(feats)
                 y.append(0 if sc=="Normal" else 1)
+        # progress + ETA
+        if progress_cb:
+            frac = (t+1)/n_ticks
+            elapsed = time.time()-t0
+            eta = (elapsed/frac)*(1-frac) if frac>0 else None
+            pct = pct_start + (pct_end-pct_start)*frac
+            progress_cb(int(pct), f"Synthesizing windows {int(frac*100)}%", eta)
     X=pd.DataFrame(X_rows).fillna(0.0); y=np.array(y)
     X_train,X_tmp,y_train,y_tmp = train_test_split(X,y,test_size=0.40,random_state=SEED,shuffle=True,stratify=y)
     X_cal,X_test,y_cal,y_test = train_test_split(X_tmp,y_tmp,test_size=0.50,random_state=SEED,shuffle=True,stratify=y_tmp)
     return (X_train,y_train),(X_cal,y_cal),(X_test,y_test),X
 
-def train_model():
-    (X_train,y_train),(X_cal,y_cal),(X_test,y_test),X_all = make_training_data(n_ticks=350)
+def train_model_with_progress(n_ticks=350):
+    # Visual elements
+    bar = st.progress(0, text="Preparing training…")
+    note = st.empty()
+    t_start = time.time()
+
+    def update(pct, msg, eta=None):
+        label = f"{msg} • ETA {fmt_eta(eta)}" if eta is not None else msg
+        bar.progress(min(100, int(pct)), text=label)
+
+    # ---- Stage 1: Data synthesis (0..70%)
+    (X_train,y_train),(X_cal,y_cal),(X_test,y_test),X_all = make_training_data(
+        n_ticks=n_ticks, progress_cb=update, pct_start=0, pct_end=70
+    )
+
+    # ---- Stage 2: Scale + Fit (70..95%) with per-iteration progress
     cols=list(X_train.columns)
     scaler = StandardScaler()
     Xtr = scaler.fit_transform(X_train); Xca=scaler.transform(X_cal); Xte=scaler.transform(X_test); Xall=scaler.transform(X_all)
@@ -328,29 +359,50 @@ def train_model():
         n_estimators=CFG.n_estimators, max_depth=CFG.max_depth, learning_rate=CFG.learning_rate,
         subsample=0.9, colsample_bytree=0.9, min_data_in_leaf=12, force_col_wise=True, random_state=SEED
     )
-    model.fit(Xtr_df, y_train)
-    explainer = shap.TreeExplainer(model)
 
-    # Conformal calibration
+    iter0 = time.time()
+    total_iters = CFG.n_estimators
+    def lgbm_progress_callback(env):
+        # env.iteration is 1-based
+        it = getattr(env, "iteration", 0)
+        it = max(0, min(total_iters, it))
+        frac = it/total_iters if total_iters>0 else 1.0
+        elapsed = time.time() - iter0
+        eta = (elapsed/frac)*(1-frac) if frac>0 else None
+        pct = 70 + 25*frac  # 70..95
+        update(pct, f"Training trees {it}/{total_iters}", eta)
+
+    update(70, "Starting model training…")
+    model.fit(Xtr_df, y_train, callbacks=[lgb.log_evaluation(period=0), lgbm_progress_callback])
+
+    # ---- Stage 3: Calibration + Metrics (95..100%)
+    t3 = time.time()
+    update(95, "Calibrating confidence…")
     cal_p = model.predict_proba(Xca_df)[:,1]
     cal_nc = 1 - np.where(y_cal==1, cal_p, 1-cal_p)
 
-    # Metrics
+    update(97, "Evaluating metrics…")
     te_p = model.predict_proba(Xte_df)[:,1]
     preds=(te_p>=CFG.threshold).astype(int)
     prec,rec,f1,_ = precision_recall_fscore_support(y_test,preds,average="binary",zero_division=0)
     auc = roc_auc_score(y_test, te_p)
 
+    # Finalize
     st.session_state.model=model
     st.session_state.scaler=scaler
-    st.session_state.explainer=explainer
+    st.session_state.explainer=shap.TreeExplainer(model)
     st.session_state.conformal_scores=cal_nc
     st.session_state.metrics={"precision":prec,"recall":rec,"f1":f1,"auc":auc}
     st.session_state.baseline = Xall_df
 
-if CFG.retrain_on_start and st.session_state.get("model") is None:
-    with st.spinner("Training model on realistic synthetic windows…"):
-        train_model()
+    total_secs = time.time()-t_start
+    st.session_state.last_train_secs = total_secs
+    bar.progress(100, text=f"Training complete • {int(total_secs)}s")
+    note.success(f"Model trained: AUC={auc:.2f}, Precision={prec:.2f}, Recall={rec:.2f} • Duration {int(total_secs)}s")
+
+# Kickoff training on first load or on demand
+if (CFG.retrain_on_start and st.session_state.get("model") is None) or retrain:
+    train_model_with_progress(n_ticks=350)
 
 def conformal_pvalue(prob):
     cal=st.session_state.conformal_scores
@@ -384,7 +436,7 @@ def tick_once():
         Xs_df = to_df(Xs, X.columns)
         prob = float(st.session_state.model.predict_proba(Xs_df)[:,1][0])
         pval = conformal_pvalue(prob) if use_conformal else None
-        sev,sev_color = severity(prob,pval)
+        sev,_ = severity(prob,pval)
         if prob>=CFG.threshold:
             shap_mat = shap_pos(st.session_state.explainer, Xs_df)
             shap_vec = shap_mat[0]
@@ -416,10 +468,11 @@ def tick_once():
     st.session_state.tick += 1
 
 # Run ticks
-if auto:
-    for _ in range(speed): tick_once()
-else:
-    if st.button("Step once"): tick_once()
+if st.session_state.get("model") is not None:
+    if auto:
+        for _ in range(speed): tick_once()
+    else:
+        if st.button("Step once"): tick_once()
 
 # =========================
 # KPIs
@@ -428,7 +481,7 @@ k1,k2,k3,k4,k5 = st.columns(5)
 with k1: st.metric("Devices", len(st.session_state.devices))
 with k2: st.metric("Incidents (session)", len(st.session_state.incidents))
 with k3:
-    auc = st.session_state.metrics.get("auc", 0)
+    auc = (st.session_state.metrics or {}).get("auc", 0)
     st.metric("Model AUC", f"{auc:.2f}")
 with k4:
     probs=[]
@@ -437,7 +490,8 @@ with k4:
         probs.append(float(st.session_state.model.predict_proba(Xs_df)[:,1][0]))
     st.metric("Fleet risk (mean prob)", f"{(np.mean(probs) if probs else 0):.2f}")
 with k5:
-    st.metric("Ticks", st.session_state.tick)
+    train_secs = st.session_state.get("last_train_secs")
+    st.metric("Last train duration", f"{int(train_secs)}s" if train_secs else "—")
 
 # =========================
 # Layout tabs
@@ -449,13 +503,13 @@ with tab_overview:
     left, right = st.columns([2,1])
 
     with left:
-        if show_map:
+        if show_map and st.session_state.get("model") is not None:
             # Base dataframe + optional type filter
             df_map = st.session_state.devices.copy()
             if type_filter and len(type_filter) < len(DEVICE_TYPES):
                 df_map = df_map[df_map["type"].isin(type_filter)].copy()
 
-            # --- Compute per-device risk (for radius) and pull latest SNR/loss for tooltip
+            # Compute risk & latest SNR/Loss for tooltip
             risks, snrs, losses = [], [], []
             for _, r in df_map.iterrows():
                 feats = st.session_state.last_features.get(r.device_id, {})
@@ -478,7 +532,7 @@ with tab_overview:
             df_map["snr"] = snrs
             df_map["packet_loss"] = losses
 
-            # --- Color by device type (RGBA)
+            # Colors per type
             type_colors = {
                 "AGV":     [0, 128, 255, 220],   # blue
                 "Truck":   [255, 165, 0, 220],   # orange
@@ -486,93 +540,35 @@ with tab_overview:
                 "Gateway": [147, 51, 234, 220],  # purple
             }
             df_map["fill_color"] = df_map["type"].map(type_colors)
-
-            # --- Label text and dynamic radius (risk-aware)
             df_map["label"] = df_map.apply(lambda r: f"{r.device_id} ({r.type})", axis=1)
             df_map["radius"] = 6 + (df_map["risk"] * 16)  # 6..22 px
 
-            # --- Layers
             layers = []
-
-            # Device points (colored by type, size by risk)
-            layers.append(
-                pdk.Layer(
-                    "ScatterplotLayer",
-                    data=df_map,
-                    get_position='[lon, lat]',
-                    get_fill_color='fill_color',
-                    get_radius='radius',
-                    get_line_color=[0, 0, 0, 140],
-                    get_line_width=1,
-                    pickable=True
-                )
-            )
-
-            # Device labels
-            layers.append(
-                pdk.Layer(
-                    "TextLayer",
-                    data=df_map,
-                    get_position='[lon, lat]',
-                    get_text='label',
-                    get_color=[20, 20, 20, 255],
-                    get_size=12,
-                    get_alignment_baseline="'top'",
-                    get_pixel_offset=[0, 10],  # a little below the dot
-                    pickable=False
-                )
-            )
-
-            # AP marker + label
+            layers.append(pdk.Layer(
+                "ScatterplotLayer", data=df_map,
+                get_position='[lon, lat]', get_fill_color='fill_color',
+                get_radius='radius', get_line_color=[0,0,0,140], get_line_width=1, pickable=True
+            ))
+            layers.append(pdk.Layer(
+                "TextLayer", data=df_map,
+                get_position='[lon, lat]', get_text='label',
+                get_color=[20,20,20,255], get_size=12,
+                get_alignment_baseline="'top'", get_pixel_offset=[0,10]
+            ))
             ap_df = pd.DataFrame([{"lat": st.session_state.ap["lat"], "lon": st.session_state.ap["lon"], "name": "AP"}])
-            layers.append(
-                pdk.Layer(
-                    "ScatterplotLayer",
-                    data=ap_df,
-                    get_position='[lon, lat]',
-                    get_fill_color='[30, 144, 255, 240]',
-                    get_radius=10
-                )
-            )
-            layers.append(
-                pdk.Layer(
-                    "TextLayer",
-                    data=ap_df.assign(label="AP"),
-                    get_position='[lon, lat]',
-                    get_text='label',
-                    get_color=[30, 144, 255, 255],
-                    get_size=14,
-                    get_alignment_baseline="'bottom'",
-                    get_pixel_offset=[0, -10]
-                )
-            )
-
-            # Jammer marker + radius (only for jamming scenario)
+            layers.append(pdk.Layer("ScatterplotLayer", data=ap_df, get_position='[lon, lat]',
+                                    get_fill_color='[30,144,255,240]', get_radius=10))
+            layers.append(pdk.Layer("TextLayer", data=ap_df.assign(label="AP"), get_position='[lon, lat]',
+                                    get_text='label', get_color=[30,144,255,255], get_size=14,
+                                    get_alignment_baseline="'bottom'", get_pixel_offset=[0,-10]))
             if scenario.startswith("Jamming"):
                 jam = st.session_state.jammer
                 jam_df = pd.DataFrame([{"lat": jam["lat"], "lon": jam["lon"], "name": "Jammer"}])
-                layers.append(
-                    pdk.Layer(
-                        "ScatterplotLayer",
-                        data=jam_df,
-                        get_position='[lon, lat]',
-                        get_fill_color='[255, 0, 0, 240]',
-                        get_radius=10
-                    )
-                )
-                layers.append(
-                    pdk.Layer(
-                        "TextLayer",
-                        data=jam_df.assign(label="Jammer"),
-                        get_position='[lon, lat]',
-                        get_text='label',
-                        get_color=[255, 0, 0, 255],
-                        get_size=14,
-                        get_alignment_baseline="'bottom'",
-                        get_pixel_offset=[0, -10]
-                    )
-                )
-                # Jammer radius ring
+                layers.append(pdk.Layer("ScatterplotLayer", data=jam_df, get_position='[lon, lat]',
+                                        get_fill_color='[255,0,0,240]', get_radius=10))
+                layers.append(pdk.Layer("TextLayer", data=jam_df.assign(label="Jammer"), get_position='[lon, lat]',
+                                        get_text='label', get_color=[255,0,0,255], get_size=14,
+                                        get_alignment_baseline="'bottom'", get_pixel_offset=[0,-10]))
                 angles = np.linspace(0, 2*np.pi, 60)
                 circle = [{
                     "path": [[
@@ -585,33 +581,17 @@ with tab_overview:
                     ] for a in angles],
                     "name": "jam_radius"
                 }]
-                layers.append(
-                    pdk.Layer(
-                        "PathLayer",
-                        circle,
-                        get_path="path",
-                        get_color=[255, 0, 0],
-                        width_scale=4,
-                        width_min_pixels=1,
-                        opacity=0.25
-                    )
-                )
-
-            # View and tooltip
+                layers.append(pdk.Layer("PathLayer", circle, get_path="path",
+                                        get_color=[255,0,0], width_scale=4, width_min_pixels=1, opacity=0.25))
             view_state = pdk.ViewState(
                 latitude=float(st.session_state.devices.lat.mean()),
                 longitude=float(st.session_state.devices.lon.mean()),
                 zoom=14, pitch=0
             )
-            tooltip = {
-                "html": "<b>{device_id}</b> • {type}<br/>Risk: {risk}<br/>SNR: {snr} dB<br/>Loss: {packet_loss}%",
-                "style": {"backgroundColor": "rgba(255,255,255,0.95)", "color": "#111"}
-            }
-
-            st.pydeck_chart(
-                pdk.Deck(layers=layers, initial_view_state=view_state, map_style=None, tooltip=tooltip),
-                use_container_width=True
-            )
+            tooltip = {"html": "<b>{device_id}</b> • {type}<br/>Risk: {risk}<br/>SNR: {snr} dB<br/>Loss: {packet_loss}%",
+                       "style": {"backgroundColor": "rgba(255,255,255,0.95)", "color": "#111"}}
+            st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view_state, map_style=None, tooltip=tooltip),
+                            use_container_width=True)
 
             # Legend
             st.markdown(
@@ -635,7 +615,6 @@ with tab_overview:
                 unsafe_allow_html=True
             )
 
-        # quick multi-metric small multiples
         fr = pd.DataFrame(list(st.session_state.fleet_records))
         if len(fr)>0:
             for y in ["snr","packet_loss","latency_ms","pos_error_m"]:
@@ -644,32 +623,29 @@ with tab_overview:
                 st.plotly_chart(fig, use_container_width=True)
 
     with right:
-        # leaderboard of risky devices
         leaderboard=[]
-        for _, r in st.session_state.devices.iterrows():
-            feats=st.session_state.last_features.get(r.device_id)
-            if not feats: continue
-            X=pd.DataFrame([feats]); Xs=st.session_state.scaler.transform(X); Xs_df=to_df(Xs,X.columns)
-            prob=float(st.session_state.model.predict_proba(Xs_df)[:,1][0])
-            pval=conformal_pvalue(prob) if use_conformal else None
-            sev,_=severity(prob,pval)
-            leaderboard.append({"device_id":r.device_id,"type":r.type,"prob":prob,"p_value":pval,"severity":sev})
+        if st.session_state.get("model") is not None:
+            for _, r in st.session_state.devices.iterrows():
+                feats=st.session_state.last_features.get(r.device_id)
+                if not feats: continue
+                X=pd.DataFrame([feats]); Xs=st.session_state.scaler.transform(X); Xs_df=to_df(Xs,X.columns)
+                prob=float(st.session_state.model.predict_proba(Xs_df)[:,1][0])
+                pval=conformal_pvalue(prob) if use_conformal else None
+                sev,_=severity(prob,pval)
+                leaderboard.append({"device_id":r.device_id,"type":r.type,"prob":prob,"p_value":pval,"severity":sev})
         if leaderboard:
             df_lead=pd.DataFrame(leaderboard).sort_values("prob",ascending=False).head(10)
             st.markdown("### Top risk devices")
             st.dataframe(df_lead, use_container_width=True)
-
-        # group incidents summary
         if st.session_state.group_incidents:
             gi = st.session_state.group_incidents[-1]
             st.markdown("### Group incident")
             st.info(f"{gi['affected']} of {gi['fleet']} devices impacted ({gi['ratio']:.0%}) • Scenario: {gi['scenario']}")
 
-# ---------- Fleet View (heatmap + table)
+# ---------- Fleet View
 with tab_fleet:
     fr = pd.DataFrame(list(st.session_state.fleet_records))
     if len(fr)>0:
-        # Heatmap: device x metric (z-score vs device baseline)
         recent = fr[fr["tick"]>=st.session_state.tick-40]
         mat = recent.groupby("device_id")[["snr","packet_loss","latency_ms","jitter_ms","pos_error_m","auth_fail_rate","crc_err","throughput_mbps","channel_util"]].mean()
         z = (mat-mat.mean())/mat.std(ddof=0).replace(0,1)
@@ -678,7 +654,7 @@ with tab_fleet:
         st.plotly_chart(fig, use_container_width=True)
     st.dataframe(st.session_state.devices, use_container_width=True)
 
-# ---------- Incidents (persona-based explanations)
+# ---------- Incidents (persona explanations)
 with tab_incidents:
     st.subheader("Incidents")
     if len(st.session_state.incidents)==0:
@@ -697,7 +673,6 @@ with tab_incidents:
                 with left:
                     tabs = st.tabs(["End Users","Domain Experts","Regulators","AI Builders","Executives"])
 
-                    # End Users
                     with tabs[0]:
                         st.markdown("#### What happened (simple)")
                         st.write(f"Device **{inc['device_id']}** behaved like **{inc['scenario']}**.")
@@ -721,7 +696,6 @@ with tab_incidents:
                             st.write("Retry and contact support if it persists.")
                         if pv is not None: st.caption(f"Confidence (lower = riskier): p-value = {pv_str}")
 
-                    # Domain Experts
                     with tabs[1]:
                         st.markdown("#### Operational assessment")
                         st.write(f"- Severity **{sev}** (prob={inc['prob']:.2f}, p={pv_str})")
@@ -737,7 +711,6 @@ with tab_incidents:
                         else:
                             st.write("1) Reject bad packets; 2) Verify signatures; 3) Audit gateway path.")
 
-                    # Regulators
                     with tabs[2]:
                         st.markdown("#### Assurance & governance")
                         st.write("- Transparent factors (see SHAP below) and plain-language summary.")
@@ -759,7 +732,6 @@ with tab_incidents:
                             key=f"dl_evidence_{inc['device_id']}_{inc['ts']}"
                         )
 
-                    # AI Builders
                     with tabs[3]:
                         st.markdown("#### Local technical explanation (SHAP)")
                         txt="\n".join([f"- {r['feature']}: {r['impact']:+.3f}" for r in inc["reasons"]])
@@ -770,7 +742,6 @@ with tab_incidents:
                         st.write("- Calibration: inductive conformal p-value.")
                         st.write("- Data realism: distance-based RF, localized jamming radius, diurnal load, coupled metrics.")
 
-                    # Executives
                     with tabs[4]:
                         st.markdown("#### Executive summary")
                         st.write(f"- Device {inc['device_id']} at risk: **{sev}**; scenario: **{inc['scenario']}**.")
@@ -784,19 +755,18 @@ with tab_incidents:
                 with right:
                     st.json({k:inc[k] for k in ["prob","p_value","tick","device_id","type","scenario"]})
 
-    # Export incidents CSV
     if st.session_state.incidents:
         df_inc = pd.DataFrame(st.session_state.incidents)
         df_inc["top_features"] = df_inc["reasons"].apply(lambda r: "; ".join([f"{x['feature']}:{x['impact']:+.3f}" for x in r]))
         csv = df_inc.drop(columns=["reasons"]).to_csv(index=False).encode("utf-8")
         st.download_button("Download incidents CSV", csv, "incidents.csv", "text/csv", key="dl_incidents_csv")
 
-# ---------- Insights (global SHAP + drift)
+# ---------- Insights
 with tab_insights:
     g1,g2 = st.columns(2)
     with g1:
         st.markdown("### Global importance (mean |SHAP|)")
-        base = st.session_state.baseline
+        base = st.session_state.get("baseline")
         if base is not None and len(base)>0:
             shap_mat = shap_pos(st.session_state.explainer, base)
             mean_abs = np.abs(shap_mat).mean(axis=0)
@@ -806,8 +776,7 @@ with tab_insights:
     with g2:
         fr = pd.DataFrame(list(st.session_state.fleet_records))
         if len(fr)>0:
-            # simple drift: compare last 200 ticks mean vs first 200
-            a = fr[fr["tick"]<st.session_state.tick*0.3]
+            a = fr[fr["tick"]<max(1, st.session_state.tick*0.3)]
             b = fr[fr["tick"]>max(0, st.session_state.tick-200)]
             cols = ["snr","packet_loss","latency_ms","jitter_ms","pos_error_m","auth_fail_rate","crc_err","throughput_mbps","channel_util"]
             drift = []
@@ -832,5 +801,5 @@ with tab_insights:
             "Synthetic but physics-inspired; do not use as-is in production",
             "Single-site example without true multi-AP handoff"
         ],
-        "version": "v2.0-realistic"
+        "version": "v2.1-realistic"
     })
