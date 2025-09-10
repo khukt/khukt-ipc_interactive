@@ -14,7 +14,7 @@ from sklearn.preprocessing import StandardScaler
 import json
 
 # -----------------------------
-# Demo constants & schema
+# Demo constants & schema Version 0.0.1
 # -----------------------------
 RAW_FEATURES = [
     "rssi", "snr", "packet_loss", "latency_ms", "jitter_ms",
