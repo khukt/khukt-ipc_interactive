@@ -15,6 +15,14 @@ from lightgbm import LGBMClassifier
 from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+import warnings
+
+# Silence the SHAP binary-classifier return-shape warning (we already handle it)
+warnings.filterwarnings(
+    "ignore",
+    message="LightGBM binary classifier .* TreeExplainer shap values output has changed to a list of ndarray",
+    category=UserWarning
+)
 
 # =========================
 # Config & constants
@@ -32,7 +40,7 @@ class Config:
     n_estimators: int = 60
     max_depth: int = 3
     learning_rate: float = 0.08
-    site_center: tuple = (59.3293, 18.0686)  # Stockholm city-ish
+    site_center: tuple = (59.3293, 18.0686)  # Stockholm-ish
     site_radius_m: float = 400
     jam_radius_m: float = 200
     retrain_on_start: bool = True
@@ -68,7 +76,11 @@ with st.sidebar:
     st.divider()
     st.subheader("Model")
     use_conformal = st.checkbox("Conformal risk (calibrated p-value)", True)
-    CFG.threshold = st.slider("Incident threshold (model prob.)", 0.50, 0.95, CFG.threshold, 0.01)
+    th_val = st.slider("Incident threshold (model prob.)", 0.30, 0.95, CFG.threshold, 0.01, key="th_slider")
+    CFG.threshold = th_val
+    if st.session_state.get("suggested_threshold") is not None:
+        if st.button(f"Apply suggested threshold ({st.session_state.suggested_threshold:.2f})"):
+            st.session_state.th_slider = float(st.session_state.suggested_threshold)
     st.caption("Alerts fire when model probability exceeds this threshold.")
     st.divider()
     st.subheader("Display")
@@ -129,12 +141,10 @@ def fmt_eta(seconds):
 # Session init
 # =========================
 def init_state():
-    # Site anchors
     lat0, lon0 = CFG.site_center
     ap_lat, ap_lon = rand_point_near(lat0, lon0, 50)
     jam_lat, jam_lon = rand_point_near(lat0, lon0, 100)
 
-    # Devices
     devices = []
     for i in range(CFG.n_devices):
         d_type = np.random.choice(DEVICE_TYPES, p=[0.45, 0.25, 0.20, 0.10])
@@ -153,7 +163,6 @@ def init_state():
     st.session_state.jammer = {"lat": jam_lat, "lon": jam_lon}
     st.session_state.tick = 0
 
-    # per-device buffers & storage
     st.session_state.dev_buf = {row.device_id: deque(maxlen=CFG.rolling_len) for _, row in st.session_state.devices.iterrows()}
     st.session_state.last_features = {}
     st.session_state.fleet_records = deque(maxlen=CFG.max_plot_points)
@@ -165,6 +174,7 @@ def init_state():
     st.session_state.conformal_scores = None
     st.session_state.metrics = {}
     st.session_state.last_train_secs = None
+    st.session_state.suggested_threshold = None
 
 if "devices" not in st.session_state or reset:
     init_state()
@@ -173,7 +183,6 @@ if "devices" not in st.session_state or reset:
 # Realistic metric synthesis
 # =========================
 def update_positions(df):
-    # Random walk for mobile units
     for i in df.index:
         if df.at[i,"type"] in MOBILE_TYPES:
             h = df.at[i,"heading"] + np.random.normal(0, 0.2)
@@ -185,8 +194,15 @@ def update_positions(df):
             df.at[i,"lon"] += dlon
     return df
 
-def rf_and_network_model(row, tick):
-    """Correlated metrics based on distances and load."""
+def rf_and_network_model(row, tick, scen=None):
+    """
+    Generate correlated metrics based on distances and load.
+    scen: one of ["Normal", "Jamming (localized)", "GPS Spoofing (subset)", "Wi-Fi Breach (AP)", "Data Tamper (gateway)"].
+    If None, falls back to current UI selection for streaming.
+    """
+    if scen is None:
+        scen = scenario
+
     ap = st.session_state.ap
     jam = st.session_state.jammer
     d_ap = max(1.0, haversine_m(row.lat, row.lon, ap["lat"], ap["lon"]))
@@ -197,46 +213,40 @@ def rf_and_network_model(row, tick):
     rssi = -40 - 18 * math.log10(d_ap) + np.random.normal(0, 2)
     rssi = float(np.clip(rssi, -90, -40))
     base_snr = 35 - 0.008 * d_ap + np.random.normal(0, 1.5)
+
     jam_penalty = 0.0
-    if scenario.startswith("Jamming"):
+    if str(scen).startswith("Jamming"):
         if d_jam <= CFG.jam_radius_m:
             jam_penalty = (CFG.jam_radius_m - d_jam)/CFG.jam_radius_m * np.random.uniform(8, 15)
     snr = max(0.0, base_snr - jam_penalty)
 
-    # Packet loss as logistic of SNR + congestion
     cong = 0.15*load
     loss = 1/(1+np.exp(0.4*(snr-15))) + cong + np.random.normal(0, 0.02)
     loss = float(np.clip(loss*100, 0, 60))  # %
 
-    # Latency & jitter grow with loss & load
     latency = 20 + 2.0*loss + 30*load + np.random.normal(0, 6)
-    jitter = 1.0 + 0.05*loss + 8*load + np.random.normal(0, 1.0)
+    jitter  = 1.0 + 0.05*loss + 8*load + np.random.normal(0, 1.0)
     latency = float(max(3, latency))
-    jitter = float(max(0.2, jitter))
+    jitter  = float(max(0.2, jitter))
 
-    # Throughput declines with loss & load; bounded
     thr = 90 - 0.8*loss - 40*load + np.random.normal(0, 5)
     thr = float(max(1, thr))
 
-    # Channel util tracks load (plus local density)
     channel_util = float(np.clip(100*(0.4+0.5*load) + np.random.normal(0, 5), 0, 100))
 
-    # Security/auth side
-    auth_fail = np.random.exponential(0.05) + (0.5 if scenario.startswith("Wi-Fi Breach") else 0)
-    crc_err = np.random.poisson(0.2)
+    auth_fail = np.random.exponential(0.05) + (0.5 if str(scen).startswith("Wi-Fi Breach") else 0)
+    crc_err   = np.random.poisson(0.2)
 
-    # GNSS positioning error
     pos_error = np.random.normal(2.0, 0.7)
-    if scenario.startswith("GPS Spoofing") and row.type in MOBILE_TYPES and np.random.rand()<0.5:
+    if str(scen).startswith("GPS Spoofing") and row.type in MOBILE_TYPES and np.random.rand()<0.5:
         pos_error += np.random.uniform(15, 40)
 
-    # Data tamper
-    if scenario.startswith("Data Tamper") and row.type in {"Gateway","Sensor"} and np.random.rand()<0.3:
+    if str(scen).startswith("Data Tamper") and row.type in {"Gateway","Sensor"} and np.random.rand()<0.3:
         crc_err += np.random.poisson(2)
         loss += np.random.uniform(2, 8)
         thr = max(1, thr - np.random.uniform(5, 15))
 
-    out = dict(
+    return dict(
         rssi=rssi, snr=float(snr),
         packet_loss=float(np.clip(loss, 0, 90)),
         latency_ms=latency, jitter_ms=jitter,
@@ -245,7 +255,6 @@ def rf_and_network_model(row, tick):
         crc_err=int(max(0, crc_err)),
         throughput_mbps=thr, channel_util=channel_util
     )
-    return out
 
 # =========================
 # Feature engineering
@@ -278,7 +287,7 @@ def feature_cols():
     return cols
 
 # =========================
-# Training (with live progress & ETA)
+# Training (with progress & ETA)
 # =========================
 def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
     """Generate rolling-window training data with progress [pct_start..pct_end]."""
@@ -297,8 +306,14 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
     X_rows=[]; y=[]
     t0 = time.time()
     for t in range(n_ticks):
-        scen = np.random.choice(["Normal","J","GPS","Breach","Tamper"],
-                                p=[0.55,0.15,0.10,0.10,0.10])
+        scen_code = np.random.choice(["Normal","J","GPS","Breach","Tamper"],
+                                     p=[0.55,0.15,0.10,0.10,0.10])
+        if   scen_code=="J":   sc="Jamming (localized)"
+        elif scen_code=="GPS": sc="GPS Spoofing (subset)"
+        elif scen_code=="Breach": sc="Wi-Fi Breach (AP)"
+        elif scen_code=="Tamper": sc="Data Tamper (gateway)"
+        else: sc="Normal"
+
         # move devices
         for i in D.index:
             if D.at[i,"type"] in MOBILE_TYPES:
@@ -307,21 +322,19 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
                 dn,de = step*math.cos(D.at[i,"heading"]), step*math.sin(D.at[i,"heading"])
                 dlat,dlon = meters_to_latlon_offset(dn,de,D.at[i,"lat"])
                 D.at[i,"lat"]+=dlat; D.at[i,"lon"]+=dlon
+
+        # generate metrics under explicit scenario 'sc'
         for _, row in D.iterrows():
             fake_row = type("R",(object,),row.to_dict())()
-            if   scen=="J": sc="Jamming (localized)"
-            elif scen=="GPS": sc="GPS Spoofing (subset)"
-            elif scen=="Breach": sc="Wi-Fi Breach (AP)"
-            elif scen=="Tamper": sc="Data Tamper (gateway)"
-            else: sc="Normal"
             ap={"lat":ap_lat,"lon":ap_lon}; jam={"lat":jam_lat,"lon":jam_lon}
             st.session_state.ap=ap; st.session_state.jammer=jam
-            metrics = rf_and_network_model(fake_row, t)
+            metrics = rf_and_network_model(fake_row, t, sc)  # <-- pass scenario
             buf[row.device_id].append(metrics)
             feats = build_window_features(buf[row.device_id])
             if feats:
                 X_rows.append(feats)
                 y.append(0 if sc=="Normal" else 1)
+
         # progress + ETA
         if progress_cb:
             frac = (t+1)/n_ticks
@@ -329,13 +342,13 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
             eta = (elapsed/frac)*(1-frac) if frac>0 else None
             pct = pct_start + (pct_end-pct_start)*frac
             progress_cb(int(pct), f"Synthesizing windows {int(frac*100)}%", eta)
+
     X=pd.DataFrame(X_rows).fillna(0.0); y=np.array(y)
     X_train,X_tmp,y_train,y_tmp = train_test_split(X,y,test_size=0.40,random_state=SEED,shuffle=True,stratify=y)
     X_cal,X_test,y_cal,y_test = train_test_split(X_tmp,y_tmp,test_size=0.50,random_state=SEED,shuffle=True,stratify=y_tmp)
     return (X_train,y_train),(X_cal,y_cal),(X_test,y_test),X
 
 def train_model_with_progress(n_ticks=350):
-    # Visual elements
     bar = st.progress(0, text="Preparing training…")
     note = st.empty()
     t_start = time.time()
@@ -356,14 +369,20 @@ def train_model_with_progress(n_ticks=350):
     Xtr_df=to_df(Xtr,cols); Xca_df=to_df(Xca,cols); Xte_df=to_df(Xte,cols); Xall_df=to_df(Xall,cols)
 
     model = LGBMClassifier(
-        n_estimators=CFG.n_estimators, max_depth=CFG.max_depth, learning_rate=CFG.learning_rate,
-        subsample=0.9, colsample_bytree=0.9, min_data_in_leaf=12, force_col_wise=True, random_state=SEED
+        n_estimators=CFG.n_estimators,
+        max_depth=CFG.max_depth,
+        learning_rate=CFG.learning_rate,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        min_data_in_leaf=12,
+        min_child_samples=12,   # match to silence warning
+        force_col_wise=True,
+        random_state=SEED
     )
 
     iter0 = time.time()
     total_iters = CFG.n_estimators
     def lgbm_progress_callback(env):
-        # env.iteration is 1-based
         it = getattr(env, "iteration", 0)
         it = max(0, min(total_iters, it))
         frac = it/total_iters if total_iters>0 else 1.0
@@ -376,7 +395,6 @@ def train_model_with_progress(n_ticks=350):
     model.fit(Xtr_df, y_train, callbacks=[lgb.log_evaluation(period=0), lgbm_progress_callback])
 
     # ---- Stage 3: Calibration + Metrics (95..100%)
-    t3 = time.time()
     update(95, "Calibrating confidence…")
     cal_p = model.predict_proba(Xca_df)[:,1]
     cal_nc = 1 - np.where(y_cal==1, cal_p, 1-cal_p)
@@ -386,6 +404,16 @@ def train_model_with_progress(n_ticks=350):
     preds=(te_p>=CFG.threshold).astype(int)
     prec,rec,f1,_ = precision_recall_fscore_support(y_test,preds,average="binary",zero_division=0)
     auc = roc_auc_score(y_test, te_p)
+
+    # Suggest threshold that maximizes F1 on test set
+    ths = np.linspace(0.30, 0.90, 61)
+    best_f1, best_th = 0.0, CFG.threshold
+    for th in ths:
+        pred = (te_p >= th).astype(int)
+        _, _, f1c, _ = precision_recall_fscore_support(y_test, pred, average="binary", zero_division=0)
+        if f1c > best_f1:
+            best_f1, best_th = f1c, th
+    st.session_state.suggested_threshold = float(best_th)
 
     # Finalize
     st.session_state.model=model
@@ -398,7 +426,10 @@ def train_model_with_progress(n_ticks=350):
     total_secs = time.time()-t_start
     st.session_state.last_train_secs = total_secs
     bar.progress(100, text=f"Training complete • {int(total_secs)}s")
-    note.success(f"Model trained: AUC={auc:.2f}, Precision={prec:.2f}, Recall={rec:.2f} • Duration {int(total_secs)}s")
+    note.success(
+        f"Model trained: AUC={auc:.2f}, Precision={prec:.2f}, Recall={rec:.2f} • "
+        f"Duration {int(total_secs)}s • Suggested threshold={best_th:.2f}"
+    )
 
 # Kickoff training on first load or on demand
 if (CFG.retrain_on_start and st.session_state.get("model") is None) or retrain:
@@ -420,7 +451,7 @@ def tick_once():
     fleet_rows=[]
     # generate per-device metrics
     for _, row in st.session_state.devices.iterrows():
-        m = rf_and_network_model(row, tick)
+        m = rf_and_network_model(row, tick, scenario)  # <-- pass live scenario
         st.session_state.dev_buf[row.device_id].append(m)
         rec = {"tick":tick, "device_id":row.device_id, "type":row.type, "lat":row.lat, "lon":row.lon, **m}
         fleet_rows.append(rec)
@@ -467,7 +498,7 @@ def tick_once():
     st.session_state.fleet_records.extend(fleet_rows)
     st.session_state.tick += 1
 
-# Run ticks
+# Run ticks (only after a model exists)
 if st.session_state.get("model") is not None:
     if auto:
         for _ in range(speed): tick_once()
@@ -485,7 +516,7 @@ with k3:
     st.metric("Model AUC", f"{auc:.2f}")
 with k4:
     probs=[]
-    for did, feats in st.session_state.last_features.items():
+    for _, feats in st.session_state.last_features.items():
         X=pd.DataFrame([feats]); Xs=st.session_state.scaler.transform(X); Xs_df=to_df(Xs,X.columns)
         probs.append(float(st.session_state.model.predict_proba(Xs_df)[:,1][0]))
     st.metric("Fleet risk (mean prob)", f"{(np.mean(probs) if probs else 0):.2f}")
@@ -591,7 +622,7 @@ with tab_overview:
             tooltip = {"html": "<b>{device_id}</b> • {type}<br/>Risk: {risk}<br/>SNR: {snr} dB<br/>Loss: {packet_loss}%",
                        "style": {"backgroundColor": "rgba(255,255,255,0.95)", "color": "#111"}}
             st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view_state, map_style=None, tooltip=tooltip),
-                            use_container_width=True)
+                            width='stretch')
 
             # Legend
             st.markdown(
@@ -620,7 +651,7 @@ with tab_overview:
             for y in ["snr","packet_loss","latency_ms","pos_error_m"]:
                 sub = fr.groupby("tick")[y].mean().reset_index()
                 fig=px.line(sub, x="tick", y=y, title=f"Fleet avg {y}")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
     with right:
         leaderboard=[]
@@ -636,13 +667,13 @@ with tab_overview:
         if leaderboard:
             df_lead=pd.DataFrame(leaderboard).sort_values("prob",ascending=False).head(10)
             st.markdown("### Top risk devices")
-            st.dataframe(df_lead, use_container_width=True)
+            st.dataframe(df_lead, use_container_width=True)  # dataframe still supports this
         if st.session_state.group_incidents:
             gi = st.session_state.group_incidents[-1]
             st.markdown("### Group incident")
             st.info(f"{gi['affected']} of {gi['fleet']} devices impacted ({gi['ratio']:.0%}) • Scenario: {gi['scenario']}")
 
-# ---------- Fleet View
+# ---------- Fleet View (heatmap + table)
 with tab_fleet:
     fr = pd.DataFrame(list(st.session_state.fleet_records))
     if len(fr)>0:
@@ -651,10 +682,10 @@ with tab_fleet:
         z = (mat-mat.mean())/mat.std(ddof=0).replace(0,1)
         fig = px.imshow(z.T, color_continuous_scale="RdBu_r", aspect="auto",
                         labels=dict(color="z-score"), title="Fleet heatmap (recent mean z-scores)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     st.dataframe(st.session_state.devices, use_container_width=True)
 
-# ---------- Incidents (persona explanations)
+# ---------- Incidents (persona-based explanations)
 with tab_incidents:
     st.subheader("Incidents")
     if len(st.session_state.incidents)==0:
@@ -721,7 +752,7 @@ with tab_incidents:
                         evidence = {
                             "ts": inc["ts"], "tick": inc["tick"], "device_id": inc["device_id"], "type": inc["type"],
                             "lat": inc["lat"], "lon": inc["lon"], "scenario": inc["scenario"], "severity": inc["severity"],
-                            "prob": inc["prob"], "p_value": inc["p_value"], "model_version": "LightGBM v2.0-demo",
+                            "prob": inc["prob"], "p_value": inc["p_value"], "model_version": "LightGBM v2.2-demo",
                             "explanations": inc["reasons"]
                         }
                         st.download_button(
@@ -761,7 +792,7 @@ with tab_incidents:
         csv = df_inc.drop(columns=["reasons"]).to_csv(index=False).encode("utf-8")
         st.download_button("Download incidents CSV", csv, "incidents.csv", "text/csv", key="dl_incidents_csv")
 
-# ---------- Insights
+# ---------- Insights (global SHAP + drift)
 with tab_insights:
     g1,g2 = st.columns(2)
     with g1:
@@ -772,7 +803,7 @@ with tab_insights:
             mean_abs = np.abs(shap_mat).mean(axis=0)
             imp = pd.DataFrame({"feature": base.columns, "mean_abs_shap": mean_abs}).sort_values("mean_abs_shap", ascending=False).head(18)
             fig = px.bar(imp, x="mean_abs_shap", y="feature", orientation="h", title="Global feature impact")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
     with g2:
         fr = pd.DataFrame(list(st.session_state.fleet_records))
         if len(fr)>0:
@@ -787,7 +818,7 @@ with tab_insights:
                 drift.append({"metric":c, "zshift":z})
             df_drift = pd.DataFrame(drift).sort_values("zshift", ascending=False)
             fig = px.bar(df_drift, x="zshift", y="metric", orientation="h", title="Drift (mean shift vs early window)")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     st.markdown("### Model card")
     st.json({
@@ -801,5 +832,5 @@ with tab_insights:
             "Synthetic but physics-inspired; do not use as-is in production",
             "Single-site example without true multi-AP handoff"
         ],
-        "version": "v2.1-realistic"
+        "version": "v2.2-realistic"
     })
