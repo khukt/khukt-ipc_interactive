@@ -18,7 +18,7 @@ from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-# Silence a noisy SHAP warning we already handle
+# Silence a noisy SHAP warning
 warnings.filterwarnings(
     "ignore",
     message="LightGBM binary classifier .* TreeExplainer shap values output has changed to a list of ndarray",
@@ -316,8 +316,9 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
     # ---------- Wi-Fi breach realism ----------
     if str(scen).startswith("Wi-Fi Breach") and d_rog <= CFG.breach_radius_m:
         if row.type in MOBILE_TYPES or np.random.rand()<0.3:
+            # FIX: use rog_rssi consistently; compute gap vs legit AP RSSI
             rog_rssi = -40 - 18 * math.log10(max(1.0, d_rog)) + np.random.normal(0, 2)
-            rogue_rssi_gap = float(rogue_rssi - rssi)
+            rogue_rssi_gap = float(rog_rssi - rssi)
             if breach_mode == "Evil Twin" or breach_mode is None:
                 deauth_rate      = float(np.clip(deauth_rate + np.random.uniform(0.25, 0.60), 0, 1.0))
                 assoc_churn      = float(np.clip(assoc_churn + np.random.uniform(0.25, 0.50), 0, 1.0))
@@ -544,7 +545,7 @@ def train_model_with_progress(n_ticks=350):
         learning_rate=CFG.learning_rate,
         subsample=0.9,
         colsample_bytree=0.9,
-        min_child_samples=12,   # keep only this (avoid clash with min_data_in_leaf)
+        min_child_samples=12,   # avoid clash with min_data_in_leaf
         force_col_wise=True,
         random_state=SEED
     )
@@ -817,13 +818,21 @@ with tab_overview:
                 ]
                 angles = np.linspace(0, 2*np.pi, 60)
                 circle = [{"path": [[
-                    rog["lon"] + meters_to_latlon_offset(CFG.breach_radius_m * math.sin(a),
-                                                         CFG.breach_radius_m * math.cos(a),
-                                                         st.session_state.devices.lat.mean())[1],
-                    rog["lat"] + meters_to_latlon_offset(CFG.breach_radius_m * math.sin(a),
-                                                         st.session_state.devices.lat.mean())[0]
+                    rog["lon"] + meters_to_latlon_offset(
+                        CFG.breach_radius_m * math.sin(a),
+                        CFG.breach_radius_m * math.cos(a),
+                        st.session_state.devices.lat.mean()
+                    )[1],
+                    rog["lat"] + meters_to_latlon_offset(
+                        CFG.breach_radius_m * math.sin(a),
+                        CFG.breach_radius_m * math.cos(a),
+                        st.session_state.devices.lat.mean()
+                    )[0]
                 ] for a in angles]}]
-                layers.append(pdk.Layer("PathLayer", circle, get_path="path", get_color=[0,200,200], width_scale=4, width_min_pixels=1, opacity=0.25))
+                layers.append(
+                    pdk.Layer("PathLayer", circle, get_path="path",
+                              get_color=[0, 200, 200], width_scale=4, width_min_pixels=1, opacity=0.25)
+                )
 
             # Spoofer overlay
             if scenario.startswith("GPS Spoofing"):
@@ -1026,12 +1035,13 @@ with tab_incidents:
                             "prob": inc["prob"], "p_value": inc["p_value"], "model_version": "LightGBM v2.3-demo",
                             "explanations": inc["reasons"]
                         }
+                        # FIX: make key unique (add tick + loop index)
                         st.download_button(
                             "Download incident evidence (JSON)",
                             data=json.dumps(evidence, indent=2).encode("utf-8"),
-                            file_name=f"incident_{inc['device_id']}_{inc['ts']}.json",
+                            file_name=f"incident_{inc['device_id']}_{inc['ts']}_{inc['tick']}.json",
                             mime="application/json",
-                            key=f"dl_evidence_{inc['device_id']}_{inc['ts']}"
+                            key=f"dl_evidence_{inc['device_id']}_{inc['ts']}_{inc['tick']}_{i}"
                         )
 
                     with tabs[3]:
