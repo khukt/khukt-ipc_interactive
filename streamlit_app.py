@@ -95,8 +95,9 @@ with st.sidebar:
         breach_mode = st.radio("Breach mode", ["Evil Twin", "Rogue Open AP", "Credential hammer"], index=0, key="breach_mode")
         CFG.breach_radius_m = st.slider("Rogue AP lure radius (m)", 50, 300, CFG.breach_radius_m, 10, key="breach_radius")
     if scenario.startswith("GPS Spoofing"):
-        st.session_state["spoof_mode"] = st.radio("Spoofing scope", ["Single device", "Localized area", "Site-wide"], index=1, key="spoof_mode")
-        st.session_state["spoof_mobile_only"] = st.checkbox("Affect mobile (AMR/Truck) only", True, key="spoof_mobile_only")
+        # FIX: do NOT assign back into st.session_state after widget creation
+        st.radio("Spoofing scope", ["Single device", "Localized area", "Site-wide"], index=1, key="spoof_mode")
+        st.checkbox("Affect mobile (AMR/Truck) only", True, key="spoof_mobile_only")
         CFG.spoof_radius_m = st.slider("Spoof coverage (m)", 50, 500, CFG.spoof_radius_m, 10, key="spoof_radius")
 
     speed = st.slider("Playback speed (ticks/refresh)", 1, 10, 3)
@@ -316,7 +317,6 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
     # ---------- Wi-Fi breach realism ----------
     if str(scen).startswith("Wi-Fi Breach") and d_rog <= CFG.breach_radius_m:
         if row.type in MOBILE_TYPES or np.random.rand()<0.3:
-            # FIX: use rog_rssi consistently; compute gap vs legit AP RSSI
             rog_rssi = -40 - 18 * math.log10(max(1.0, d_rog)) + np.random.normal(0, 2)
             rogue_rssi_gap = float(rog_rssi - rssi)
             if breach_mode == "Evil Twin" or breach_mode is None:
@@ -340,7 +340,6 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
         pos_error += np.random.uniform(0.6*bias, 1.2*bias) + 0.5*drift
 
     # ---------- Data Tamper realism ----------
-    # Integrity/freshness baseline (robust to new IDs like T00 during training)
     if "seq_counter" not in st.session_state:
         st.session_state.seq_counter = {}
     if row.device_id not in st.session_state.seq_counter:
@@ -384,7 +383,6 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
             schema_violation_rate += float(np.random.uniform(0.30, 0.70))
             payload_entropy = float(np.random.uniform(4.5, 6.0))
 
-    # Compose output
     return dict(
         rssi=float(rssi), snr=float(snr),
         packet_loss=float(loss), latency_ms=float(latency), jitter_ms=float(jitter),
@@ -458,7 +456,6 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
                          heading=np.random.uniform(0,2*np.pi)))
     D=pd.DataFrame(devs)
 
-    # Ensure seq counters exist for training-time device IDs
     if "seq_counter" not in st.session_state:
         st.session_state.seq_counter = {}
     for dev_id in D["device_id"]:
@@ -476,7 +473,6 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
         elif scen_code=="Tamper":sc="Data Tamper (gateway)"; jm=bm=None
         else:                    sc="Normal"; jm=bm=None
 
-        # move devices
         for i in D.index:
             if D.at[i,"type"] in MOBILE_TYPES:
                 D.at[i,"heading"] += np.random.normal(0,0.3)
@@ -485,7 +481,6 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
                 dlat,dlon = meters_to_latlon_offset(dn,de,D.at[i,"lat"])
                 D.at[i,"lat"]+=dlat; D.at[i,"lon"]+=dlon
 
-        # anchors for training pass
         st.session_state.ap={"lat":ap_lat,"lon":ap_lon}
         st.session_state.jammer={"lat":jam_lat,"lon":jam_lon}
         st.session_state.rogue={"lat":rog_lat,"lon":rog_lon}
@@ -528,12 +523,10 @@ def train_model_with_progress(n_ticks=350):
         label = f"{msg} • ETA {fmt_eta(eta)}" if eta is not None else msg
         bar.progress(min(100, int(pct)), text=label)
 
-    # ---- Stage 1: Data synthesis (0..70%)
     (X_train,y_train),(X_cal,y_cal),(X_test,y_test),X_all = make_training_data(
         n_ticks=n_ticks, progress_cb=update, pct_start=0, pct_end=70
     )
 
-    # ---- Stage 2: Scale + Fit (70..95%)
     cols=list(X_train.columns)
     scaler = StandardScaler()
     Xtr = scaler.fit_transform(X_train); Xca=scaler.transform(X_cal); Xte=scaler.transform(X_test); Xall=scaler.transform(X_all)
@@ -545,7 +538,7 @@ def train_model_with_progress(n_ticks=350):
         learning_rate=CFG.learning_rate,
         subsample=0.9,
         colsample_bytree=0.9,
-        min_child_samples=12,   # avoid clash with min_data_in_leaf
+        min_child_samples=12,
         force_col_wise=True,
         random_state=SEED
     )
@@ -564,7 +557,6 @@ def train_model_with_progress(n_ticks=350):
     update(70, "Starting model training…")
     model.fit(Xtr_df, y_train, callbacks=[lgb.log_evaluation(period=0), lgbm_progress_callback])
 
-    # ---- Stage 3: Calibration + Metrics (95..100%)
     update(95, "Calibrating confidence…")
     cal_p = model.predict_proba(Xca_df)[:,1]
     cal_nc = 1 - np.where(y_cal==1, cal_p, 1-cal_p)
@@ -615,7 +607,6 @@ def tick_once():
     st.session_state.devices = update_positions(st.session_state.devices.copy())
     tick = st.session_state.tick
 
-    # Keep spoof targeting cached
     if "spoof_target_id" not in st.session_state:
         st.session_state.spoof_target_id = np.random.choice(st.session_state.devices["device_id"])
 
@@ -630,7 +621,6 @@ def tick_once():
             breach_mode=st.session_state.get("breach_mode")
         )
 
-        # Apply GPS spoofing scope here (single/local/site-wide)
         if scenario.startswith("GPS Spoofing"):
             spf = st.session_state.spoofer
             d_spf = haversine_m(row.lat, row.lon, spf["lat"], spf["lon"])
@@ -642,7 +632,7 @@ def tick_once():
                 hit = True
             elif selected == "Single device":
                 hit = (row.device_id == st.session_state.spoof_target_id)
-            else:  # Localized area
+            else:
                 hit = (d_spf <= CFG.spoof_radius_m)
 
             if hit and (not mobile_only or row.type in MOBILE_TYPES):
@@ -658,7 +648,6 @@ def tick_once():
         rec = {"tick":tick, "device_id":row.device_id, "type":row.type, "lat":row.lat, "lon":row.lon, **m}
         fleet_rows.append(rec)
 
-    # Inference + incidents
     incidents_this_tick=[]
     for _, row in st.session_state.devices.iterrows():
         feats = build_window_features(st.session_state.dev_buf[row.device_id])
@@ -865,7 +854,6 @@ with tab_overview:
             st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view_state, map_style=None, tooltip=tooltip),
                             use_container_width=True)
 
-            # Legend
             st.markdown(
                 """
                 <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;">
@@ -1035,7 +1023,6 @@ with tab_incidents:
                             "prob": inc["prob"], "p_value": inc["p_value"], "model_version": "LightGBM v2.3-demo",
                             "explanations": inc["reasons"]
                         }
-                        # FIX: make key unique (add tick + loop index)
                         st.download_button(
                             "Download incident evidence (JSON)",
                             data=json.dumps(evidence, indent=2).encode("utf-8"),
