@@ -370,6 +370,10 @@ def rf_and_network_model(row, tick, scen=None, tamper_mode=None, crypto_enabled=
 
     # ---------- Data Tamper realism ----------
     # Integrity/freshness baseline
+    if "seq_counter" not in st.session_state:
+        st.session_state.seq_counter = {}
+    if row.device_id not in st.session_state.seq_counter:
+        st.session_state.seq_counter[row.device_id] = 0
     st.session_state.seq_counter[row.device_id] += 1
     seq_no = st.session_state.seq_counter[row.device_id]
     device_ts = tick + np.random.normal(0, 0.05)
@@ -482,6 +486,12 @@ def make_training_data(n_ticks=400, progress_cb=None, pct_start=0, pct_end=70):
                          speed_mps=(np.random.uniform(0.5,2.5) if d_type in MOBILE_TYPES else 0.0),
                          heading=np.random.uniform(0,2*np.pi)))
     D=pd.DataFrame(devs)
+    # Ensure seq counters exist for training-time device IDs
+    if "seq_counter" not in st.session_state:
+        st.session_state.seq_counter = {}
+    for dev_id in D["device_id"]:
+        st.session_state.seq_counter.setdefault(dev_id, 0)
+
     buf = {d: deque(maxlen=CFG.rolling_len) for d in D.device_id}
     X_rows=[]; y=[]
     t0 = time.time()
