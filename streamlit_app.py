@@ -19,7 +19,6 @@ from lightgbm import LGBMClassifier
 from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, brier_score_loss
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.tree import DecisionTreeClassifier  # kept (unused) if you want to switch
 
 # Silence noisy SHAP warning
 warnings.filterwarnings(
@@ -237,6 +236,8 @@ if show_eu_status:
 def to_df(X, cols): return pd.DataFrame(X, columns=cols)
 
 def shap_pos(explainer, X_df):
+    if explainer is None: 
+        return np.zeros((len(X_df), len(X_df.columns)))
     vals = explainer.shap_values(X_df)
     if isinstance(vals, list):
         return vals[1] if len(vals) > 1 else vals[0]
@@ -457,13 +458,14 @@ def init_state():
     st.session_state.seq_counter = {row.device_id: 0 for _, row in st.session_state.devices.iterrows()}
     st.session_state.spoof_target_id = None
     st.session_state.ui_nonce = st.session_state.get("ui_nonce") or str(int(time.time()))
+
     # --- safe defaults so first load doesn't crash ---
     _defaults = {
         "model": None,
         "scaler": None,
         "explainer": None,
         "conformal_scores": None,
-        "metrics": {},            # <— prevents KeyError on first load
+        "metrics": {},
         "baseline": None,
         "eval": {},
         "training_info": {},
@@ -474,19 +476,16 @@ def init_state():
         "type_metrics": {},
         "suggested_threshold": None,
         "last_train_secs": None,
-        "latest_probs": {},       # ensure KPIs work pre-training
+        "latest_probs": {},
     }
     for k, v in _defaults.items():
         st.session_state.setdefault(k, v)
-
-    # training/meta objects may be set from cache below
-
 
 if "devices" not in st.session_state or reset:
     init_state()
 
 # =========================
-# Realistic metric synthesis (same as you had, trimmed for brevity in comments)
+# Realistic metric synthesis
 # =========================
 def update_positions(df):
     latc, lonc = CFG.site_center
@@ -1092,7 +1091,7 @@ def train_model_with_progress(n_ticks=350):
     _log_train(f"Training complete in {int(total_secs)}s (AUC={auc:.2f}, F1={f1:.2f}).")
 
 def conformal_pvalue(prob):
-    cal=st.session_state.conformal_scores
+    cal=st.session_state.get("conformal_scores")
     if cal is None: return None
     nc=1-prob
     return float((np.sum(cal>=nc)+1)/(len(cal)+1))
@@ -1126,7 +1125,6 @@ if retrain or (CFG.retrain_on_start and st.session_state.get("model") is None an
 # Streaming tick (batch-optimized)
 # =========================
 def feature_cols_cached():
-    # after training, these are the scaler/model columns
     if st.session_state.get("baseline") is not None:
         return list(st.session_state.baseline.columns)
     return feature_cols()
@@ -1193,7 +1191,6 @@ def tick_once():
     if feats_list:
         X = pd.DataFrame(feats_list).fillna(0.0)
         cols = feature_cols_cached()
-        # align columns to trained model's expectation
         X = X.reindex(columns=cols, fill_value=0.0)
         Xs = st.session_state.scaler.transform(X)
         probs = st.session_state.model.predict_proba(Xs)[:,1]
@@ -1259,12 +1256,14 @@ def tick_once():
 
                     # SHAP reasons for the ML type head
                     try:
-                        tvals = st.session_state.type_explainer.shap_values(xrow)
-                        if isinstance(tvals, list) and len(tvals)>best_idx:
-                            tv = tvals[best_idx][0]
-                        else:
-                            tv = tvals[0]
-                        type_pairs = sorted(list(zip(xrow.columns, tv)), key=lambda kv: abs(kv[1]), reverse=True)[:6]
+                        type_expl = st.session_state.get("type_explainer")
+                        if type_expl is not None:
+                            tvals = type_expl.shap_values(xrow)
+                            if isinstance(tvals, list) and len(tvals)>best_idx:
+                                tv = tvals[best_idx][0]
+                            else:
+                                tv = tvals[0]
+                            type_pairs = sorted(list(zip(xrow.columns, tv)), key=lambda kv: abs(kv[1]), reverse=True)[:6]
                     except Exception:
                         type_pairs=[]
                 else:
@@ -1375,7 +1374,7 @@ def audit_log_json():
     return _to_builtin({"incidents": st.session_state.get("incidents", [])})
 
 # =========================
-# SHAP renderer for incidents (snapshot) — SCOPED KEYS
+# SHAP renderer for incidents — SCOPED KEYS
 # =========================
 def incident_id(inc):
     return f"{inc['device_id']}_{inc['ts']}_{inc['tick']}"
@@ -1533,7 +1532,6 @@ def render_incident_card(inc, role, scope="main"):
         concise = [{"feature": r["feature"], "impact": r["impact"]} for r in inc["reasons"]][:3]
         st.markdown("\n".join([f"- {_feature_label(_feature_base(x['feature']))}: impact {x['impact']:+.2f}" for x in concise]))
 
-        lcol, rcol = st.columns(2)
         if st.button("Acknowledge", key=f"ack_{base_key}"):
             st.session_state.incident_labels[base_key] = {"ack": True, "false_positive": False}
         if st.button("Mark false positive", key=f"fp_{base_key}"):
@@ -1549,13 +1547,13 @@ def render_incident_card(inc, role, scope="main"):
         st.json({k: inc[k] for k in ["tick","device_id","type","prob","p_value"]})
 
 # =========================
-# KPIs banner
+# KPIs banner (robust)
 # =========================
 k1,k2,k3,k4,k5 = st.columns(5)
 with k1: st.metric("Devices", len(st.session_state.devices))
 with k2: st.metric("Incidents (session)", len(st.session_state.incidents))
 with k3:
-    amet = st.session_state.get("metrics") or {}
+    met = st.session_state.get("metrics") or {}
     auc = met.get("auc", 0.0)
     st.metric("Model AUC", f"{auc:.2f}")
     if help_mode: st.caption("**Model AUC**: discrimination; 0.5 = random, 1.0 = perfect. Higher is better.")
@@ -1723,11 +1721,12 @@ with tab_fleet:
         cols = ["snr","packet_loss","latency_ms","jitter_ms","pos_error_m","crc_err","throughput_mbps","channel_util",
                 "noise_floor_dbm","cca_busy_frac","phy_error_rate","deauth_rate","assoc_churn","eapol_retry_rate","dhcp_fail_rate"]
         cols = [c for c in cols if c in recent.columns]
-        mat = recent.groupby("device_id")[cols].mean()
-        z = (mat-mat.mean())/mat.std(ddof=0).replace(0,1)
-        fig = px.imshow(z.T, color_continuous_scale="RdBu_r", aspect="auto",
-                        labels=dict(color="z-score"), title="Fleet heatmap (recent mean z-scores)")
-        st.plotly_chart(fig, use_container_width=True, key="fleet_heatmap")
+        if len(cols)>0:
+            mat = recent.groupby("device_id")[cols].mean()
+            z = (mat-mat.mean())/mat.std(ddof=0).replace(0,1)
+            fig = px.imshow(z.T, color_continuous_scale="RdBu_r", aspect="auto",
+                            labels=dict(color="z-score"), title="Fleet heatmap (recent mean z-scores)")
+            st.plotly_chart(fig, use_container_width=True, key="fleet_heatmap")
     st.dataframe(st.session_state.devices, use_container_width=True)
 
 # ---------- Incidents
@@ -1776,6 +1775,8 @@ with tab_insights:
             st.plotly_chart(fig, use_container_width=True, key=f"global_importance_{nonce}")
             if help_mode:
                 st.caption("**Global importance (mean |SHAP|)**: average absolute contribution across many samples — bigger bars = more influential.")
+        else:
+            st.info("Train the model to view global importance.")
     with g2:
         st.markdown("### Calibration (reliability)")
         ev = st.session_state.get("eval") or {}
@@ -1789,12 +1790,13 @@ with tab_insights:
                 if np.any(msk):
                     bin_p.append(te_p[msk].mean())
                     bin_y.append(y_test[msk].mean())
-            df_rel = pd.DataFrame({"confidence": bin_p, "empirical": bin_y})
-            fig = px.line(df_rel, x="confidence", y="empirical", title=f"Reliability (Brier {ev.get('brier', np.nan):.3f}) — closer to diagonal is better")
-            fig.add_scatter(x=[0,1], y=[0,1], mode="lines", name="perfect")
-            st.plotly_chart(fig, use_container_width=True, key=f"calibration_curve_{nonce}")
-            if help_mode:
-                st.caption("**Calibration reliability**: predicted vs actual frequencies; closer to diagonal is better. **Brier score** lower is better.")
+            if bin_p:
+                df_rel = pd.DataFrame({"confidence": bin_p, "empirical": bin_y})
+                fig = px.line(df_rel, x="confidence", y="empirical", title=f"Reliability (Brier {ev.get('brier', np.nan):.3f}) — closer to diagonal is better")
+                fig.add_scatter(x=[0,1], y=[0,1], mode="lines", name="perfect")
+                st.plotly_chart(fig, use_container_width=True, key=f"calibration_curve_{nonce}")
+                if help_mode:
+                    st.caption("**Calibration reliability**: predicted vs actual frequencies; closer to diagonal is better. **Brier score** lower is better.")
         else:
             st.info("Train (or retrain) to view calibration.")
     st.markdown("### Feature glossary")
