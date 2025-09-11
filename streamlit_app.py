@@ -457,7 +457,30 @@ def init_state():
     st.session_state.seq_counter = {row.device_id: 0 for _, row in st.session_state.devices.iterrows()}
     st.session_state.spoof_target_id = None
     st.session_state.ui_nonce = st.session_state.get("ui_nonce") or str(int(time.time()))
+    # --- safe defaults so first load doesn't crash ---
+    _defaults = {
+        "model": None,
+        "scaler": None,
+        "explainer": None,
+        "conformal_scores": None,
+        "metrics": {},            # <— prevents KeyError on first load
+        "baseline": None,
+        "eval": {},
+        "training_info": {},
+        "type_clf": None,
+        "type_cols": [],
+        "type_labels": [],
+        "type_explainer": None,
+        "type_metrics": {},
+        "suggested_threshold": None,
+        "last_train_secs": None,
+        "latest_probs": {},       # ensure KPIs work pre-training
+    }
+    for k, v in _defaults.items():
+        st.session_state.setdefault(k, v)
+
     # training/meta objects may be set from cache below
+
 
 if "devices" not in st.session_state or reset:
     init_state()
@@ -1532,7 +1555,8 @@ k1,k2,k3,k4,k5 = st.columns(5)
 with k1: st.metric("Devices", len(st.session_state.devices))
 with k2: st.metric("Incidents (session)", len(st.session_state.incidents))
 with k3:
-    auc = (st.session_state.metrics or {}).get("auc", 0)
+    amet = st.session_state.get("metrics") or {}
+    auc = met.get("auc", 0.0)
     st.metric("Model AUC", f"{auc:.2f}")
     if help_mode: st.caption("**Model AUC**: discrimination; 0.5 = random, 1.0 = perfect. Higher is better.")
 with k4:
