@@ -147,7 +147,7 @@ DOMAIN_MAP = {
 # Streamlit page
 # =========================
 st.set_page_config(page_title="TRUST AI — Wireless Threats (Sundsvall)", layout="wide")
-st.title("TRUST AI — Realistic Wireless Threat Detection (Sundsvall, Mid Sweden University)")
+st.title("TRUST AI — Wireless Threat Detection Demo")
 st.caption("AMR & logistics fleet • RF/network realism • LightGBM + SHAP + Conformal • Type head (multiclass + rules) • Persona XAI • Cached models (no re-training on refresh)")
 
 # ---- Cached model store to survive browser refresh (process cache) ----
