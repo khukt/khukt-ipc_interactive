@@ -1,5 +1,5 @@
 # app.py version 2.0
-# TRUST AI — Realistic Wireless Threats (Sundsvall, Mid Sweden University)
+# TRUST AI — Wireless Threats Detection Demo
 # Two-step pipeline: LightGBM anomaly detector + (LightGBM multiclass + rules) for attack typing
 # Caching to avoid retraining on refresh, persona-aware XAI, governance, and training explainer
 
