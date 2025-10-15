@@ -1499,7 +1499,7 @@ def render_incident_body_for_role(inc, role, scope="main"):
         top3 = sorted(inc.get("reasons", []), key=lambda x: abs(x.get("impact",0)), reverse=True)[:3]
         if top3:
             st.markdown("**Top signals involved**")
-            st.write(", ".join([_feature_label(_feature_base_name(x['feature'])) for x in top3]))
+            st.write(", ".join([_feature_label(_feature_base(x['feature'])) for x in top3]))
         st.markdown("**Governance**")
         lab = st.session_state.incident_labels.get(base_key) or {}
         st.write(f"- Human oversight: {'Yes' if lab.get('ack') else 'No'} · False Positive: {'Yes' if lab.get('false_positive') else 'No'}")
@@ -1592,7 +1592,7 @@ def render_incident_card(inc, role, scope="main"):
         if role in ["Domain Expert", "AI Builder"]:
             concise = [{"feature": r["feature"], "impact": r["impact"]} for r in inc.get("reasons", [])][:5]
             if concise:
-                st.markdown("\n".join([f"- {_feature_label(_feature_base_name(x['feature']))}: {x['impact']:+.2f}" for x in concise]))
+                st.markdown("\n".join([f"- {_feature_label(_feature_base(x['feature']))}: {x['impact']:+.2f}" for x in concise]))
 
         # Executive KPI strip on the card face
         if role == "Executive":
