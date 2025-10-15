@@ -1533,7 +1533,9 @@ def render_incident_body_for_role(inc, role, scope="main"):
             data=json.dumps(_to_builtin(evidence), indent=2).encode("utf-8"),
             file_name=f"incident_{inc['device_id']}_{inc['ts']}_{inc['tick']}.json",
             mime="application/json",
-     def render_incident_card(inc, role, scope="main"):
+        )
+
+def render_incident_card(inc, role, scope="main"):
     base_key = f"{incident_id(inc)}_{scope}"
     pv = inc.get("p_value"); pv_str = f"{pv:.3f}" if pv is not None else "—"
     sev = inc.get("severity", "—")
@@ -1831,30 +1833,32 @@ with tab_governance:
     if help_mode:
         st.caption("This demo surfaces transparency artifacts inline to help stakeholders understand data, model, confidence, and controls. Not legal advice.")
 
-    st.markdown("### Data transparency")
-    st.write("- **Source**: synthetic telemetry (no personal data).")
-    st.write("- **Signals**: RF/network (e.g., SNR, loss), GNSS error, integrity checks.")
-    st.write("- **Retention**: incidents kept in session memory; export below.")
-    c = st.columns(2)
-    with c[0]:
+st.markdown("### Data transparency")
+st.write("- **Source**: synthetic telemetry (no personal data).")
+st.write("- **Signals**: RF/network (e.g., SNR, loss), GNSS error, integrity checks.")
+st.write("- **Retention**: incidents kept in session memory; export below.")
+c = st.columns(2)
+with c[0]:
+    st.download_button(
+        "Download data schema (JSON)",
+        data=json.dumps(_to_builtin(data_schema_json()), indent=2).encode("utf-8"),
+        file_name="data_schema.json",
+        mime="application/json",
+        key=f"gov_dl_schema_json_{nonce}"
+    )
+with c[1]:
+    if st.session_state.get("incidents"):
         st.download_button(
-            "Download data schema (JSON)",
-            data=json.dumps(_to_builtin(data_schema_json()), indent=2).encode("utf-8"),
-            file_name="data_schema.json",
+            "Download incidents audit log (JSON)",
+            data=json.dumps(audit_log_json(), indent=2).encode("utf-8"),
+            file_name="incidents_audit_log.json",
             mime="application/json",
-            key=f"gov_dl_schema_json_{nonce}"
+            key=f"gov_dl_audit_json_{nonce}"
         )
-    with c[1]:
-        if st.session_state.incidents:
-            st.download_button(
-                "Download audit log (incidents.json)",
-                data=json.dumps(audit_log_json(), indent=2).encode("utf-8"),
-                file_name="incidents_audit_log.json",
-                mime="application/json",
-                key=f"gov_dl_audit_json_{nonce}"
-            )
-        else:
-            st.caption("No incidents yet to export.")
+    else:
+        st.caption("No incidents yet to export.")
+
+
 
     st.markdown("### Model transparency")
     mc = model_card_data()
@@ -1876,13 +1880,6 @@ with tab_governance:
         "- **Thresholding**: suggested threshold = max F1 on validation split."
     )
     _render_training_explainer(nonce)
-            file_name="incidents_audit_log.json",
-                mime="application/json",
-                key=f"gov_dl_audit_json_{nonce}"
-            )
-        else:
-            st.caption("No incidents yet to export.")
-
     st.markdown("### Model transparency")
     mc = model_card_data()
     st.json(mc, expanded=False)
