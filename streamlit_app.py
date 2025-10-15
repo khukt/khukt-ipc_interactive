@@ -210,6 +210,16 @@ with st.sidebar:
     type_filter = st.multiselect("Show device types", DEVICE_TYPES, default=DEVICE_TYPES)
     role = st.selectbox("Viewer role", ["End User", "Domain Expert", "Regulator", "AI Builder", "Executive"], index=3)
 
+    
+    # Sidebar help for first-time users
+    with st.sidebar:
+        st.markdown("### Help & Tips")
+        st.write("• **Overview:** fleet health & KPIs.")
+        st.write("• **Incidents:** detected issues & what to do.")
+        st.write("• **Insights:** model-level explanations.")
+        st.write("• **Governance:** transparency, evidence downloads.")
+        st.markdown("---")
+        st.caption("Tip: Change **Viewer role** to see a persona-tailored view.")
     st.divider()
     retrain = st.button("Train / Retrain models")
 
@@ -1300,6 +1310,7 @@ def tick_once():
 
     if incidents_this_tick:
         affected = {i["device_id"] for i in incidents_this_tick}
+        st.toast(f"{len(incidents_this_tick)} new incident(s) detected.", icon="🚨")
         ratio = len(affected)/len(st.session_state.devices)
         if ratio>=0.25:
             st.session_state.group_incidents.append({
@@ -1390,7 +1401,7 @@ def render_device_inspector_from_incident(inc, topk=8, scope="main"):
     if not feats:
         st.info("Not enough samples for device window yet.")
         return
-    base_key = f"{incident_id(inc)}_{scope}"
+        base_key = f"{incident_id(inc)}_{scope}"
     X = pd.DataFrame([feats]).fillna(0.0)
     cols = feature_cols_cached()
     X = X.reindex(columns=cols, fill_value=0.0)
@@ -1455,6 +1466,18 @@ def _exec_kpis():
     else:
         pct_ack_24h = 100.0
     return n_week, delta, pct_ack_24h
+
+def render_hero_header(title: str, subtitle: str = "", tips: list[str] | None = None, border: bool = True):
+    """Render a consistent hero header with optional quick tips."""
+    cont = st.container(border=border)
+    with cont:
+        st.markdown(f"### {title}")
+        if subtitle:
+            st.caption(subtitle)
+        if tips:
+            with st.expander("🧭 Quick Start", expanded=False):
+                for t in tips:
+                    st.write("- " + t)
 # Role-aware incident rendering & categorization
 # =========================
 def incident_category(inc):
@@ -1505,7 +1528,10 @@ def render_incident_body_for_role(inc, role, scope="main"):
         st.write(f"- Human oversight: {'Yes' if lab.get('ack') else 'No'} · False Positive: {'Yes' if lab.get('false_positive') else 'No'}")
 
     elif role == "Domain Expert":
-        st.markdown("**Signals & playbook**")
+        tabs = st.tabs(["Summary","Inspector"])
+        with tabs[0]:
+            st.markdown("**Summary**")
+            st.markdown("**Signals & playbook**")
         # Domain cues based on scenario
         s = inc.get("scenario","")
         if "Jamming" in s:
@@ -1521,7 +1547,8 @@ def render_incident_body_for_role(inc, role, scope="main"):
         t1.button("Check logs", key=f"tri_logs_{base_key}")
         t2.button("Validate device health", key=f"tri_health_{base_key}")
         t3.button("Open spectrum view", key=f"tri_spectrum_{base_key}")
-        with st.expander("Device Inspector (local SHAP)"):
+        with tabs[1]:
+            st.markdown("**Device Inspector (local SHAP)**")
             render_device_inspector_from_incident(inc, topk=8, scope=scope)
 
     elif role == "Regulator":
@@ -1568,7 +1595,9 @@ def render_incident_body_for_role(inc, role, scope="main"):
             st.caption("No feature vector captured for this incident.")
 
 def render_incident_card(inc, role, scope="main"):
-    base_key = f"{incident_id(inc)}_{scope}"
+    cont = st.container(border=True)
+    with cont:
+        base_key = f"{incident_id(inc)}_{scope}"
     pv = inc.get("p_value"); pv_str = f"{pv:.3f}" if pv is not None else "—"
     sev = inc.get("severity", "—")
     color = {"High":"red","Medium":"orange","Low":"green"}.get(sev, "gray")
@@ -1653,6 +1682,7 @@ st.session_state.active_tab = None
 # ---------- Overview
 with tab_overview:
     st.session_state.active_tab = 'overview'
+    render_hero_header("Overview", "Fleet health & key KPIs.", tips=["Watch severity and risk KPIs.","Use tabs to dive deeper.","Switch Viewer role to change the perspective."])
     left, right = st.columns([2,1])
 
     with left:
@@ -1908,7 +1938,7 @@ def _render_executive_incidents_overview():
 # ---------- Incidents
 with tab_incidents:
     st.session_state.active_tab = 'incidents'
-    st.subheader("Incidents")
+    render_hero_header("Incidents", "Detected issues and recommended actions.", tips=["Use severity chips to triage.","Click Details for role-specific explanations.","Executives: review the summary first, then toggle details."])
 
     # Executive: show fleet overview first, toggle to reveal per-incident details
     render_list = True
