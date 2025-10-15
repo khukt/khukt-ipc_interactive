@@ -211,21 +211,33 @@ with st.sidebar:
     role = st.selectbox("Viewer role", ["End User", "Domain Expert", "Regulator", "AI Builder", "Executive"], index=3)
 
     
-    # Sidebar help for first-time users
-    with st.sidebar:
+    
+# Role-aware color theme banner
+role_colors = {
+    "End User":"#27ae60",
+    "Domain Expert":"#0ea5e9",
+    "Regulator":"#8b5cf6",
+    "AI Builder":"#ef4444",
+    "Executive":"#374151"
+}
+c_color = role_colors.get(role, "#0ea5e9")
+st.markdown(f"<div style='background:{c_color};padding:8px;border-radius:6px;margin-bottom:8px;color:white'>"
+            f"<strong>Viewer role:</strong> {role}</div>", unsafe_allow_html=True)
+# Sidebar help for first-time users
+with st.sidebar:
         st.markdown("### Help & Tips")
-        st.write("• **Overview:** fleet health & KPIs.")
-        st.write("• **Incidents:** detected issues & what to do.")
-        st.write("• **Insights:** model-level explanations.")
-        st.write("• **Governance:** transparency, evidence downloads.")
-        st.markdown("---")
-        st.caption("Tip: Change **Viewer role** to see a persona-tailored view.")
-    st.divider()
-    retrain = st.button("Train / Retrain models")
+st.write("• **Overview:** fleet health & KPIs.")
+st.write("• **Incidents:** detected issues & what to do.")
+st.write("• **Insights:** model-level explanations.")
+st.write("• **Governance:** transparency, evidence downloads.")
+st.markdown("---")
+st.caption("Tip: Change **Viewer role** to see a persona-tailored view.")
+st.divider()
+retrain = st.button("Train / Retrain models")
 
-    st.divider()
-    help_mode = st.checkbox("Help mode (inline hints)", True)
-    show_eu_status = st.checkbox("Show EU AI Act status banner", True)
+st.divider()
+help_mode = st.checkbox("Help mode (inline hints)", True)
+show_eu_status = st.checkbox("Show EU AI Act status banner", True)
 
 # Simple onboarding + EU status
 if help_mode:
@@ -1478,6 +1490,35 @@ def render_hero_header(title: str, subtitle: str = "", tips: list[str] | None = 
             with st.expander("🧭 Quick Start", expanded=False):
                 for t in tips:
                     st.write("- " + t)
+
+def _simulate_incident(attack_type: str):
+    """Add a synthetic incident into session_state.incidents for demo/simulation."""
+    import random, time
+    devices = st.session_state.get("devices")
+    if devices is None or len(devices)==0:
+        st.error("No devices available to simulate against.")
+        return
+    # pick a device
+    did = devices.iloc[0].device_id
+    row = devices.iloc[0]
+    tick = st.session_state.get("tick", 0)
+    ts = int(time.time())
+    mapping = {
+        "Jamming": ("Jamming (localized)", "High", 0.95, 0.01, [{"feature":"snr","impact":-3.2}]),
+        "Access Breach": ("Access Breach (AP/gNB)", "High", 0.9, 0.02, [{"feature":"deauth_rate","impact":2.1}]),
+        "GPS Spoofing": ("GPS Spoofing (subset)", "Medium", 0.75, 0.05, [{"feature":"pos_error_m","impact":1.5}]),
+        "Data Tamper": ("Data Tamper (gateway)", "High", 0.92, 0.01, [{"feature":"schema_violation_rate","impact":2.0}])
+    }
+    scen, sev, prob, pval, reasons = mapping.get(attack_type, ("Normal", "Low", 0.3, None, []))
+    inc = dict(
+        ts=ts, tick=tick, device_id=did, type=row.type, lat=float(row.lat), lon=float(row.lon),
+        scenario=scen, prob=float(prob), p_value=(None if pval is None else float(pval)),
+        severity=sev, features=st.session_state.get("last_features", {}).get(did, {}),
+        reasons=[{"feature":r["feature"], "impact":float(r["impact"])} for r in reasons],
+        type_label=attack_type, type_conf=0.9, type_reasons=[{"feature":"sim","impact":1.0}]
+    )
+    st.session_state.incidents.append(inc)
+    st.toast(f"Simulated {attack_type} on device {did}", icon="🧪")
 # Role-aware incident rendering & categorization
 # =========================
 def incident_category(inc):
@@ -1939,6 +1980,25 @@ def _render_executive_incidents_overview():
 with tab_incidents:
     st.session_state.active_tab = 'incidents'
     render_hero_header("Incidents", "Detected issues and recommended actions.", tips=["Use severity chips to triage.","Click Details for role-specific explanations.","Executives: review the summary first, then toggle details."])
+
+# Friendly attack explanations and simulation (End Users)
+if role == "End User":
+    with st.expander("What are these attack types? (click to learn)"):
+        st.markdown("**Jamming** — radio interference that reduces signal quality (e.g., noisy environment).")
+        st.markdown("**Access Breach** — unauthorized access attempts or broken authentication at AP/gNB.")
+        st.markdown("**GPS Spoofing** — false GPS signals causing wrong location readings.")
+        st.markdown("**Data Tamper** — data integrity problems, modified packets or corrupted gateway data.")
+        st.caption("Use the buttons below to safely simulate these attacks in the demo environment.")
+        c1,c2,c3,c4 = st.columns(4)
+        if c1.button("Simulate Jamming"):
+            _simulate_incident("Jamming")
+        if c2.button("Simulate Access Breach"):
+            _simulate_incident("Access Breach")
+        if c3.button("Simulate GPS Spoofing"):
+            _simulate_incident("GPS Spoofing")
+        if c4.button("Simulate Data Tamper"):
+            _simulate_incident("Data Tamper")
+
 
     # Executive: show fleet overview first, toggle to reveal per-incident details
     render_list = True
