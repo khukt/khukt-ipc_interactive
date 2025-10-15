@@ -1468,62 +1468,77 @@ def render_incident_body_for_role(inc, role, scope="main"):
     base_key = f"{incident_id(inc)}_{scope}"
     pv = inc.get("p_value"); pv_str = f"{pv:.3f}" if pv is not None else "—"
     sev = inc.get("severity", "—")
-    cols = st.columns(3)
-    cols[0].metric("Severity", sev)
-    cols[1].metric("Prob.", f"{inc['prob']:.2f}")
-    cols[2].metric("p-value", pv_str)
 
-    tlabel = inc.get("type_label","Unknown")
-    tconf  = inc.get("type_conf", None)
-    if tconf is not None:
-        st.metric("Attack type", f"{tlabel}", f"{tconf*100:.0f}%")
-    else:
-        st.metric("Attack type", f"{tlabel}")
+    # Shared compact metrics for Details (kept for all roles, but moved out of card face)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Severity", sev)
+    m2.metric("Prob.", f"{inc['prob']:.2f}")
+    m3.metric("p-value", pv_str)
 
-    st.markdown("#### Why is this anomalous?")
-    st.markdown(build_anomaly_explanation(inc))
-    st.markdown("#### Why this attack type?")
-    st.markdown(build_type_explanation(inc))
-
+    # Role-specific bodies
     if role == "End User":
-        with st.expander("What to do"):
-            if "Jamming" in inc["scenario"]:
-                st.write("Move 50–100 m away or retry; the network will change channel.")
-            elif "Access Breach" in inc["scenario"]:
-                st.write("Avoid joining unknown SSIDs/PLMNs; protections are active.")
-            elif "GPS Spoofing" in inc["scenario"]:
-                st.write("Use UWB/IMU fallback; limit speed in GNSS-denied mode.")
-            else:
-                st.write("Retry; if it persists, notify ops.")
+        st.markdown("**What happened**")
+        st.write(f"We detected unusual activity on device **{inc['device_id']}** during **{inc['scenario']}**.")
+        st.markdown("**What should I do?**")
+        if sev == "High":
+            st.write("- Follow the on-screen steps or contact support.")
+        elif sev == "Medium":
+            st.write("- Try a quick check: restart device; if the issue persists, contact support.")
+        else:
+            st.write("- No action needed right now.")
+        st.markdown("**Confidence**")
+        st.progress(int(inc['prob'] * 100), text=f"Model confidence ~ {inc['prob']:.0%}")
+        if pv is not None:
+            st.caption("Lower p-value = stronger evidence (conformal calibration).")
+
+    elif role == "Executive":
+        st.markdown("**Executive summary**")
+        st.write(f"- Device **{inc['device_id']}** flagged **{sev}** during **{inc['scenario']}**; type: **{inc.get('type_label','Unknown')}**.")
+        st.write("- Impact: potential service or security risk; mitigations active.")
+        # Top 3 root causes (from reasons)
+        top3 = sorted(inc.get("reasons", []), key=lambda x: abs(x.get("impact",0)), reverse=True)[:3]
+        if top3:
+            st.markdown("**Top signals involved**")
+            st.write(", ".join([_feature_label(_feature_base_name(x['feature'])) for x in top3]))
+        st.markdown("**Governance**")
+        lab = st.session_state.incident_labels.get(base_key) or {}
+        st.write(f"- Human oversight: {'Yes' if lab.get('ack') else 'No'} · False Positive: {'Yes' if lab.get('false_positive') else 'No'}")
 
     elif role == "Domain Expert":
-        with st.expander("Signals & Playbook"):
-            if "Jamming" in inc["scenario"]:
-                st.write("↑ noise_floor_dbm, ↓ SNR/SINR, ↑ PHY/BLER, ↑ loss/latency")
-            elif "Access Breach" in inc["scenario"]:
-                st.write("↑ deauth_rate, ↑ assoc_churn, ↑ eapol_retry_rate / dhcp_fail_rate, rogue_rssi_gap>0")
-            elif "Data Tamper" in inc["scenario"]:
-                st.write("↑ dup_ratio, ↑ ts_skew_s, ↑ schema_violation_rate, ↑ hmac_fail_rate (if enabled)")
-            elif "GPS Spoofing" in inc["scenario"]:
-                st.write("↑ pos_error_m with odd GNSS: hdop, sats, Doppler var, clock drift, C/N0 patterns")
+        st.markdown("**Signals & playbook**")
+        # Domain cues based on scenario
+        s = inc.get("scenario","")
+        if "Jamming" in s:
+            st.write("↑ packet_loss, ↑ jitter, ↓ SNR/SINR, ↑ CCA busy; check RF spectrum & interference sources.")
+        elif "Access Breach" in s:
+            st.write("↑ deauth_rate, ↑ assoc_churn, auth anomalies; inspect logs (RADIUS/EAPOL/DHCP).")
+        elif "GPS Spoofing" in s:
+            st.write("↑ pos_error_m, GNSS HDOP/sats/Doppler variance; verify GNSS quality & antenna.")
+        elif "Data Tamper" in s:
+            st.write("↑ schema_violation_rate / HMAC failures; verify integrity pipeline.")
+        # Triage quick actions (no-op buttons for now)
+        t1, t2, t3 = st.columns(3)
+        t1.button("Check logs", key=f"tri_logs_{base_key}")
+        t2.button("Validate device health", key=f"tri_health_{base_key}")
+        t3.button("Open spectrum view", key=f"tri_spectrum_{base_key}")
         with st.expander("Device Inspector (local SHAP)"):
             render_device_inspector_from_incident(inc, topk=8, scope=scope)
 
     elif role == "Regulator":
-        # Oversight & SLA summary lines
-        lab = st.session_state.incident_labels.get(f"{incident_id(inc)}_{scope}") or {}
+        st.markdown("**Assurance & governance**")
+        st.write("- Calibrated confidence via conformal p-value (lower is stronger evidence).")
+        st.write("- Audit trail available; no personal data—technical metadata only.")
+        # Oversight & SLA
+        lab = st.session_state.incident_labels.get(base_key) or {}
         st.write(f"- Human oversight: {'Yes' if lab.get('ack') else 'No'} (ack / FP present)")
         if lab.get('label_ts'):
             dt = lab['label_ts'] - inc.get('ts', lab['label_ts'])
             st.write(f"- Reviewed within 24h: {'Yes' if dt <= 24*3600 else 'No'}")
-        else:
-            st.write("- Reviewed within 24h: No")
-        
-        st.markdown("**Assurance & governance**")
-        st.write("- Calibrated confidence via conformal p-value (lower is stronger evidence).")
-        st.write("- Audit trail available; no personal data—technical telemetry only.")
+        # Evidence download
         evidence = {
-            "ts": inc["ts"], "tick": inc["tick"], "device_id": inc["device_id"], "type": inc["type"],
+            "ts": inc["ts"],
+            "tick": inc["tick"],
+            "device_id": inc["device_id"],
             "lat": inc["lat"], "lon": inc["lon"], "scenario": inc["scenario"], "severity": inc["severity"],
             "prob": inc["prob"], "p_value": inc["p_value"], "model_version": "LightGBM v3.0-demo",
             "explanations": inc["reasons"], "type_label": inc.get("type_label"), "type_conf": inc.get("type_conf")
@@ -1533,7 +1548,24 @@ def render_incident_body_for_role(inc, role, scope="main"):
             data=json.dumps(_to_builtin(evidence), indent=2).encode("utf-8"),
             file_name=f"incident_{inc['device_id']}_{inc['ts']}_{inc['tick']}.json",
             mime="application/json",
+            key=f"dl_evidence_{base_key}"
         )
+
+    else:  # AI Builder
+        st.markdown("**Model view**")
+        st.write("- Type margin:", inc.get("type_margin", "—"))
+        st.write("- Conformal:", "ON" if inc.get("p_value") is not None else "OFF")
+        # Standardized z-vector table (features for this tick if available)
+        feats = inc.get("features", {})
+        if feats:
+            X = pd.DataFrame([feats]).fillna(0.0)
+            cols = feature_cols_cached()
+            X = X.reindex(columns=cols, fill_value=0.0)
+            Xs = st.session_state.scaler.transform(X)
+            Xs_df = pd.DataFrame(Xs, columns=cols)
+            st.dataframe(Xs_df.T.rename(columns={0: "z-value"}), use_container_width=True)
+        else:
+            st.caption("No feature vector captured for this incident.")
 
 def render_incident_card(inc, role, scope="main"):
     base_key = f"{incident_id(inc)}_{scope}"
@@ -1544,13 +1576,32 @@ def render_incident_card(inc, role, scope="main"):
 
     cols = st.columns([1.8, 1])
     with cols[0]:
-        st.markdown(
-            f"**{inc['device_id']}** ({inc['type']}) · {inc['scenario']} · prob={inc['prob']:.2f} · p={pv_str} · {badge}",
-            unsafe_allow_html=True
-        )
-        concise = [{"feature": r["feature"], "impact": r["impact"]} for r in inc["reasons"]][:3]
-        st.markdown("\n".join([f"- {_feature_label(_feature_base(x['feature']))}: impact {x['impact']:+.2f}" for x in concise]))
+        # Role-specific compact header
+        if role in ["End User", "Executive"]:
+            st.markdown(
+                f"**{inc['device_id']}** ({inc['type']}) · {inc['scenario']} · {badge}",
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                f"**{inc['device_id']}** ({inc['type']}) · {inc['scenario']} · prob={inc['prob']:.2f} · p={pv_str} · {badge}",
+                unsafe_allow_html=True
+            )
 
+        # Concise reasons preview (only for power users)
+        if role in ["Domain Expert", "AI Builder"]:
+            concise = [{"feature": r["feature"], "impact": r["impact"]} for r in inc.get("reasons", [])][:5]
+            if concise:
+                st.markdown("\n".join([f"- {_feature_label(_feature_base_name(x['feature']))}: {x['impact']:+.2f}" for x in concise]))
+
+        # Executive KPI strip on the card face
+        if role == "Executive":
+            k1, k2 = st.columns(2)
+            n_week, delta, pct_ack = _exec_kpis()
+            with k1: st.metric("Incidents (7d)", n_week, f"{delta:+.0f}%")
+            with k2: st.metric("Critical ack <24h", f"{pct_ack:.0f}%")
+
+        # Actions + Details
         if st.button("Acknowledge", key=f"ack_{base_key}"):
             st.session_state.incident_labels[base_key] = {"ack": True, "false_positive": False, "label_ts": int(time.time())}
         if st.button("Mark false positive", key=f"fp_{base_key}"):
@@ -1559,11 +1610,16 @@ def render_incident_card(inc, role, scope="main"):
         if label:
             tag = "FALSE POSITIVE" if label.get("false_positive") else "ACKNOWLEDGED"
             st.caption(f"Label: **{tag}** (human oversight)")
+
         with st.expander("Details"):
             render_incident_body_for_role(inc, role, scope=scope)
 
     with cols[1]:
-        st.json({k: inc[k] for k in ["tick","device_id","type","prob","p_value"]})
+        # Minimal JSON for context; hide for End Users to reduce noise
+        if role != "End User":
+            st.json({k: inc[k] for k in ["tick","device_id","type","prob","p_value"]})
+        else:
+            st.caption("")
 
 # =========================
 # KPIs banner (robust)
