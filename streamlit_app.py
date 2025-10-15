@@ -1591,8 +1591,12 @@ tab_overview, tab_fleet, tab_incidents, tab_insights, tab_governance = st.tabs(
     ["Overview", "Fleet View", "Incidents", "Insights", "Governance"]
 )
 
+st.session_state.active_tab = None
+
+
 # ---------- Overview
 with tab_overview:
+    st.session_state.active_tab = 'overview'
     left, right = st.columns([2,1])
 
     with left:
@@ -1734,6 +1738,7 @@ with tab_overview:
 
 # ---------- Fleet View
 with tab_fleet:
+    st.session_state.active_tab = 'fleet'
     fr = pd.DataFrame(list(st.session_state.fleet_records))
     if len(fr)>0 and show_heatmap:
         recent = fr[fr["tick"]>=st.session_state.tick-40]
@@ -1750,6 +1755,7 @@ with tab_fleet:
 
 # ---------- Incidents
 with tab_incidents:
+    st.session_state.active_tab = 'incidents'
     st.subheader("Incidents")
     all_inc = st.session_state.incidents
     if not all_inc:
@@ -1781,6 +1787,7 @@ with tab_incidents:
 
 # ---------- Insights
 with tab_insights:
+    st.session_state.active_tab = 'insights'
     nonce = st.session_state.ui_nonce
     g1,g2 = st.columns(2)
     with g1:
@@ -1822,44 +1829,51 @@ with tab_insights:
     st.table(pd.DataFrame({"Feature (base)": list(FEATURE_GLOSSARY.keys()),
                            "Meaning": [FEATURE_GLOSSARY[k] for k in FEATURE_GLOSSARY]}))
 
+
 # ---------- Governance
 with tab_governance:
+    st.session_state.active_tab = 'governance'
     nonce = st.session_state.ui_nonce
     st.subheader("EU AI Act — Transparency & Governance (Demo)")
-    c1,c2,c3 = st.columns(3)
-    with c1: st.success("✅ Data transparency");  st.success("✅ Model transparency")
-    with c2: st.success("✅ Logging & evidence"); st.success("✅ Human oversight")
-    with c3: st.info("ℹ️ Risk: Demonstration system (synthetic, non-production)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.success("✅ Data transparency")
+        st.success("✅ Model transparency")
+    with c2:
+        st.success("✅ Logging & evidence")
+        st.success("✅ Human oversight")
+    with c3:
+        st.info("ℹ️ Risk: Demonstration system (synthetic, non-production)")
     if help_mode:
-        st.caption("This demo surfaces transparency artifacts inline to help stakeholders understand data, model, confidence, and controls. Not legal advice.")
+        st.caption("This demo surfaces transparency artifacts in one place so different audiences can understand data, model, confidence, and controls. Not legal advice.")
 
-st.markdown("### Data transparency")
-st.write("- **Source**: synthetic telemetry (no personal data).")
-st.write("- **Signals**: RF/network (e.g., SNR, loss), GNSS error, integrity checks.")
-st.write("- **Retention**: incidents kept in session memory; export below.")
-c = st.columns(2)
-with c[0]:
-    st.download_button(
-        "Download data schema (JSON)",
-        data=json.dumps(_to_builtin(data_schema_json()), indent=2).encode("utf-8"),
-        file_name="data_schema.json",
-        mime="application/json",
-        key=f"gov_dl_schema_json_{nonce}"
-    )
-with c[1]:
-    if st.session_state.get("incidents"):
+    # Data transparency
+    st.markdown("### Data transparency")
+    st.write("- **Source**: synthetic telemetry (no personal data).")
+    st.write("- **Signals**: RF/network (e.g., SNR, loss), GNSS error, integrity checks.")
+    st.write("- **Retention**: incidents kept in session memory; export below.")
+    c = st.columns(2)
+    with c[0]:
         st.download_button(
-            "Download incidents audit log (JSON)",
-            data=json.dumps(audit_log_json(), indent=2).encode("utf-8"),
-            file_name="incidents_audit_log.json",
+            "Download data schema (JSON)",
+            data=json.dumps(_to_builtin(data_schema_json()), indent=2).encode("utf-8"),
+            file_name="data_schema.json",
             mime="application/json",
-            key=f"gov_dl_audit_json_{nonce}"
+            key=f"gov_dl_schema_json_{nonce}"
         )
-    else:
-        st.caption("No incidents yet to export.")
+    with c[1]:
+        if st.session_state.get("incidents"):
+            st.download_button(
+                "Download incidents audit log (JSON)",
+                data=json.dumps(audit_log_json(), indent=2).encode("utf-8"),
+                file_name="incidents_audit_log.json",
+                mime="application/json",
+                key=f"gov_dl_audit_json_{nonce}"
+            )
+        else:
+            st.caption("No incidents yet to export.")
 
-
-
+    # Model transparency
     st.markdown("### Model transparency")
     mc = model_card_data()
     st.json(mc, expanded=False)
@@ -1871,26 +1885,7 @@ with c[1]:
         key=f"gov_dl_model_card_{nonce}"
     )
 
-    st.markdown("## Training Explainer")
-    st.markdown(
-        "- **Data generation**: synthetic, physics-inspired telemetry (RF/QoS, GNSS, access/auth, integrity, cellular).  \n"
-        "- **Windows & features**: rolling window statistics (mean/std/min/max/last/slope/z/jump).  \n"
-        "- **Binary detector**: LightGBM, imbalance-aware; conformal p-values.  \n"
-        "- **Type head**: LightGBM multiclass + domain rules (fused), with calibrated confidence.  \n"
-        "- **Thresholding**: suggested threshold = max F1 on validation split."
-    )
-    _render_training_explainer(nonce)
-    st.markdown("### Model transparency")
-    mc = model_card_data()
-    st.json(mc, expanded=False)
-    st.download_button(
-        "Download model card (JSON)",
-        data=json.dumps(_to_builtin(mc), indent=2).encode("utf-8"),
-        file_name="model_card.json",
-        mime="application/json",
-        key=f"gov_dl_model_card_{nonce}"
-    )
-
+    # Training explainer
     st.markdown("## Training Explainer")
     st.markdown(
         "- **Data generation**: synthetic, physics-inspired telemetry (RF/QoS, GNSS, access/auth, integrity, cellular).  \n"
