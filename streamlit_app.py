@@ -1809,38 +1809,124 @@ with tab_fleet:
             st.plotly_chart(fig, use_container_width=True, key="fleet_heatmap")
     st.dataframe(st.session_state.devices, use_container_width=True)
 
+
+def _render_executive_incidents_overview():
+    """Show a fleet-level incidents overview for Executives before any per-device details."""
+    incs = st.session_state.get("incidents", [])
+    devices_df = st.session_state.get("devices")
+    fleet_n = len(devices_df) if devices_df is not None else 0
+    if not incs:
+        st.info("No incidents yet.")
+        return
+
+    import pandas as pd
+    import numpy as np
+    import plotly.express as px
+    now = int(time.time())
+    week = 7*24*3600
+    week_ago = now - week
+    prev_ago = week_ago - week
+
+    df = pd.DataFrame(incs)
+    # KPIs
+    df_recent = df[df["ts"] >= week_ago]
+    df_prev = df[(df["ts"] >= prev_ago) & (df["ts"] < week_ago)]
+    n_week = len(df_recent)
+    n_prev = len(df_prev) or 1
+    delta = (n_week - len(df_prev)) / n_prev * 100.0
+
+    # % critical acknowledged within 24h
+    labels = st.session_state.get("incident_labels", {})
+    def ack24(row):
+        key = f"{row['device_id']}_{row['ts']}_{row['tick']}_main"
+        lab = labels.get(key) or {}
+        ts_lab = lab.get("label_ts")
+        return bool(ts_lab and (ts_lab - row["ts"] <= 24*3600))
+    df["ack24"] = df.apply(ack24, axis=1) if len(df)>0 else False
+    crit = df[df["severity"] == "High"]
+    pct_ack_24h = (100.0 * crit["ack24"].mean()) if len(crit)>0 else 100.0
+
+    # Affected devices (unique) in last 7d
+    affected = df_recent["device_id"].nunique()
+    pct_fleet = 100.0 * affected / fleet_n if fleet_n else 0.0
+
+    # Top signals (aggregate absolute impact)
+    top_pairs = {}
+    for reasons in df_recent.get("reasons", []):
+        if isinstance(reasons, list):
+            for r in reasons:
+                base = _feature_base(r.get("feature",""))
+                top_pairs[base] = top_pairs.get(base, 0.0) + abs(float(r.get("impact", 0.0)))
+    top3 = sorted(top_pairs.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    top3_labels = ", ".join([_feature_label(k) for k,_ in top3]) if top3 else "—"
+
+    # KPI row
+    k1,k2,k3,k4 = st.columns(4)
+    with k1: st.metric("Incidents (7d)", n_week, f"{delta:+.0f}%")
+    with k2: st.metric("Critical ack <24h", f"{pct_ack_24h:.0f}%")
+    with k3: st.metric("Affected devices", f"{affected}/{fleet_n}")
+    with k4: st.metric("Fleet impacted", f"{pct_fleet:.0f}%")
+
+    # Charts
+    c1, c2 = st.columns(2)
+    with c1:
+        # Severity distribution
+        sev_counts = df_recent["severity"].value_counts().reindex(["High","Medium","Low"]).fillna(0).astype(int)
+        sev_df = pd.DataFrame({"severity": sev_counts.index, "count": sev_counts.values})
+        fig = px.pie(sev_df, values="count", names="severity", title="Severity distribution (7d)")
+        st.plotly_chart(fig, use_container_width=True, key="exec_sev_pie")
+    with c2:
+        # Incidents by day
+        df_recent["day"] = pd.to_datetime(df_recent["ts"], unit="s").dt.date
+        trend = df_recent.groupby("day").size().reset_index(name="count")
+        fig = px.bar(trend, x="day", y="count", title="Incidents by day (7d)")
+        st.plotly_chart(fig, use_container_width=True, key="exec_trend_bar")
+
+    # Top signals
+    st.markdown("**Top signals involved (7d)**")
+    st.write(top3_labels)
+
 # ---------- Incidents
 with tab_incidents:
     st.session_state.active_tab = 'incidents'
     st.subheader("Incidents")
-    all_inc = st.session_state.incidents
-    if not all_inc:
-        st.success("No incidents yet.")
-    else:
-        cat_map = {}
-        for inc in reversed(all_inc):
-            cat_map.setdefault(incident_category(inc), []).append(inc)
-        order = ["Jamming", "Access Breach", "GPS Spoofing", "Data Tamper", "Other"]
-        cats_present = [c for c in order if c in cat_map] + [c for c in cat_map if c not in order]
-        tab_labels = [f"{c} ({len(cat_map[c])})" for c in cats_present]
-        tabs = st.tabs(tab_labels + [f"All ({len(all_inc)})"])
-        for t_idx, c in enumerate(cats_present):
-            with tabs[t_idx]:
-                sev_sel = st.multiselect("Show severities", ["High","Medium","Low"], default=["High","Medium","Low"], key=f"sev_{c}")
-                for inc in cat_map[c]:
-                    if inc["severity"] in sev_sel:
-                        render_incident_card(inc, role, scope=f"cat_{c}")
-        with tabs[-1]:
-            sev_sel_all = st.multiselect("Show severities", ["High","Medium","Low"], default=["High","Medium","Low"], key="sev_all_tabs")
-            for inc in all_inc:
-                if inc["severity"] in sev_sel_all:
-                    render_incident_card(inc, role, scope="all")
+
+    # Executive: show fleet overview first, toggle to reveal per-incident details
+    render_list = True
+    if role == "Executive":
+        _render_executive_incidents_overview()
+        render_list = st.checkbox("Show individual incidents", False, key="exec_show_incidents")
+
+    if render_list:
+        all_inc = st.session_state.incidents
+        if not all_inc:
+            st.success("No incidents yet.")
+        else:
+            cat_map = {}
+            for inc in reversed(all_inc):
+                cat_map.setdefault(incident_category(inc), []).append(inc)
+            order = ["Jamming", "Access Breach", "GPS Spoofing", "Data Tamper", "Other"]
+            cats_present = [c for c in order if c in cat_map] + [c for c in cat_map if c not in order]
+            tab_labels = [f"{c} ({len(cat_map[c])})" for c in cats_present]
+            tabs = st.tabs(tab_labels + [f"All ({len(all_inc)})"])
+            for t_idx, c in enumerate(cats_present):
+                with tabs[t_idx]:
+                    sev_sel = st.multiselect("Show severities", ["High","Medium","Low"], default=["High","Medium","Low"], key=f"sev_{c}")
+                    for inc in cat_map[c]:
+                        if inc["severity"] in sev_sel:
+                            render_incident_card(inc, role, scope=f"cat_{c}")
+            with tabs[-1]:
+                sev_sel_all = st.multiselect("Show severities", ["High","Medium","Low"], default=["High","Medium","Low"], key="sev_all_tabs")
+                for inc in all_inc:
+                    if inc["severity"] in sev_sel_all:
+                        render_incident_card(inc, role, scope="all")
+
+    # CSV export (always available when there are incidents)
     if st.session_state.incidents:
         df_inc = pd.DataFrame(st.session_state.incidents)
         df_inc["top_features"] = df_inc["reasons"].apply(lambda r: "; ".join([f"{x['feature']}:{x['impact']:+.3f}" for x in r]))
         csv = df_inc.drop(columns=["reasons","type_reasons"]).to_csv(index=False).encode("utf-8")
         st.download_button("Download incidents CSV", csv, "incidents.csv", "text/csv", key="dl_incidents_csv")
-
 # ---------- Insights
 with tab_insights:
     st.session_state.active_tab = 'insights'
