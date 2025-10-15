@@ -1867,6 +1867,13 @@ def _render_executive_incidents_overview():
     with k3: st.metric("Affected devices", f"{affected}/{fleet_n}")
     with k4: st.metric("Fleet impacted", f"{pct_fleet:.0f}%")
 
+    # Estimated business impact (device-minutes)
+    sev_w = df_recent["severity"].map({"High":3.0, "Medium":1.0, "Low":0.25}).fillna(0)
+    base_duration_min = 10.0  # assumed avg. duration per incident
+    impact_device_minutes = float(sev_w.sum() * base_duration_min)
+    st.metric("Est. impact (device-min)", f"{impact_device_minutes:.0f}")
+    st.caption("Heuristic: weight High=3, Medium=1, Low=0.25; × 10 minutes per incident.")
+
     # Charts
     c1, c2 = st.columns(2)
     with c1:
@@ -1881,6 +1888,18 @@ def _render_executive_incidents_overview():
         trend = df_recent.groupby("day").size().reset_index(name="count")
         fig = px.bar(trend, x="day", y="count", title="Incidents by day (7d)")
         st.plotly_chart(fig, use_container_width=True, key="exec_trend_bar")
+
+    # Type distribution (7d)
+    def _cat_from_scenario(s: str) -> str:
+        for cat in ["Jamming", "Access Breach", "GPS Spoofing", "Data Tamper"]:
+            if isinstance(s, str) and s.startswith(cat):
+                return cat
+        return "Other"
+    df_recent["category"] = df_recent["scenario"].apply(_cat_from_scenario)
+    type_counts = df_recent["category"].value_counts().reset_index()
+    type_counts.columns = ["category", "count"]
+    fig = px.bar(type_counts, x="category", y="count", title="Incidents by type (7d)")
+    st.plotly_chart(fig, use_container_width=True, key="exec_type_bar")
 
     # Top signals
     st.markdown("**Top signals involved (7d)**")
