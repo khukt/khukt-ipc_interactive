@@ -209,6 +209,14 @@ with st.sidebar:
     show_heatmap = st.checkbox("Show fleet heatmap (metric z-scores)", True)
     type_filter = st.multiselect("Show device types", DEVICE_TYPES, default=DEVICE_TYPES)
     role = st.selectbox("Viewer role", ["End User", "Domain Expert", "Regulator", "AI Builder", "Executive"], index=3)
+# Apply role choice from Home cards, if set
+role_override = st.session_state.pop('home_set_role', None)
+if role_override:
+    # Streamlit selectbox doesn't allow programmatic selection directly post-creation;
+    # we reflect override with a small notice for this session.
+    st.success(f"Role set to: {role_override}")
+    role = role_override
+
 
     
     
@@ -1720,6 +1728,87 @@ tab_overview, tab_fleet, tab_incidents, tab_insights, tab_governance = st.tabs(
 st.session_state.active_tab = None
 
 
+
+def render_home():
+    st.session_state.active_tab = 'home'
+    render_hero_header(
+        "Welcome",
+        "Pick your role, run a scenario, and review incidents. This guided home page helps you start fast.",
+        tips=[
+            "1) Choose your Viewer role above.",
+            "2) Select a Scenario and press ▶ Run.",
+            "3) Open Incidents for role-specific explanations.",
+            "4) See Insights for model-wide behavior; Governance for evidence."
+        ],
+        border=True
+    )
+    # Role cards
+    st.markdown("#### Who are you today?")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("**End User**")
+        st.caption("Plain-language status & next steps.")
+        if st.button("Use End User view", key="home_role_user"):
+            st.session_state['home_set_role'] = "End User"
+    with c2:
+        st.markdown("**Executive**")
+        st.caption("Fleet KPIs, risk and trends first.")
+        if st.button("Use Executive view", key="home_role_exec"):
+            st.session_state['home_set_role'] = "Executive"
+    with c3:
+        st.markdown("**Domain Expert**")
+        st.caption("Signals, triage tools, SHAP inspector.")
+        if st.button("Use Expert view", key="home_role_expert"):
+            st.session_state['home_set_role'] = "Domain Expert"
+    c4, c5 = st.columns(2)
+    with c4:
+        st.markdown("**Regulator**")
+        st.caption("Assurance, conformity, audit evidence.")
+        if st.button("Use Regulator view", key="home_role_reg"):
+            st.session_state['home_set_role'] = "Regulator"
+    with c5:
+        st.markdown("**AI Builder**")
+        st.caption("Model calibration, margins, z-vectors.")
+        if st.button("Use AI Builder view", key="home_role_ai"):
+            st.session_state['home_set_role'] = "AI Builder"
+
+    # Getting started checklist
+    st.markdown("#### Getting started")
+    with st.container(border=True):
+        st.write("✅ Set your **Viewer role** (top-left).")
+        st.write("✅ Choose a **Scenario** and press **Run**.")
+        st.write("✅ Review **Incidents** (role-specific view).")
+        st.write("✅ Explore **Insights** (global behavior).")
+        st.write("✅ Check **Governance** (model/data transparency).")
+
+    # Recent activity (incidents summary)
+    incs = st.session_state.get("incidents", [])
+    st.markdown("#### Recent activity")
+    if not incs:
+        st.info("No incidents yet. Click ▶ Run to generate activity, or use the simulator in Incidents.")
+    else:
+        import pandas as pd, numpy as np, plotly.express as px
+        df = pd.DataFrame(incs).tail(50)
+        col1, col2 = st.columns(2)
+        with col1:
+            sev_counts = df["severity"].value_counts().reindex(["High","Medium","Low"]).fillna(0).astype(int)
+            pie_df = pd.DataFrame({"severity": sev_counts.index, "count": sev_counts.values})
+            fig = px.pie(pie_df, values="count", names="severity", title="Recent severity split")
+            st.plotly_chart(fig, use_container_width=True, key="home_sev_pie")
+        with col2:
+            df["when"] = pd.to_datetime(df["ts"], unit="s")
+            trend = df.groupby(df["when"].dt.floor("H")).size().reset_index(name="count")
+            fig = px.line(trend, x="when", y="count", markers=True, title="Incidents by hour (recent)")
+            st.plotly_chart(fig, use_container_width=True, key="home_trend_line")
+        st.dataframe(df[["ts","device_id","scenario","severity","prob","p_value"]].tail(10), use_container_width=True)
+
+    # Footer help
+    st.markdown("---")
+    st.caption("Tip: Need a safe demo? Use **End User** role + **What are these attack types?** expander in Incidents to simulate events.")
+
+# ---------- Home
+with tab_home:
+    render_home()
 # ---------- Overview
 with tab_overview:
     st.session_state.active_tab = 'overview'
