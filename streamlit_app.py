@@ -1424,6 +1424,37 @@ def render_device_inspector_from_incident(inc, topk=8, scope="main"):
         st.dataframe(Xs_df.T.rename(columns={0: "z-value"}), use_container_width=True)
 
 # =========================
+
+# =========================
+# Executive KPIs helper
+# =========================
+def _exec_kpis():
+    """Compute lightweight KPIs for Executive cards."""
+    now = int(time.time())
+    week_ago = now - 7*24*3600
+    incs = st.session_state.get("incidents", [])
+    labels = st.session_state.get("incident_labels", {})
+    # Incidents this week
+    recent = [i for i in incs if i.get("ts", 0) >= week_ago]
+    n_week = len(recent)
+    # Simple baseline: previous week count for delta
+    prev = [i for i in incs if week_ago - 7*24*3600 <= i.get("ts", 0) < week_ago]
+    n_prev = len(prev) or 1
+    delta = (n_week - len(prev)) / n_prev * 100.0
+    # % critical acknowledged within 24h
+    crit = [i for i in incs if i.get("severity") == "High"]
+    if crit:
+        acknowledged = 0
+        for inc in crit:
+            key = f"{incident_id(inc)}_main"
+            lab = labels.get(key) or {}
+            ts_lab = lab.get("label_ts")
+            if ts_lab and (ts_lab - inc.get("ts", ts_lab)) <= 24*3600:
+                acknowledged += 1
+        pct_ack_24h = 100.0 * acknowledged / len(crit)
+    else:
+        pct_ack_24h = 100.0
+    return n_week, delta, pct_ack_24h
 # Role-aware incident rendering & categorization
 # =========================
 def incident_category(inc):
@@ -1479,6 +1510,15 @@ def render_incident_body_for_role(inc, role, scope="main"):
             render_device_inspector_from_incident(inc, topk=8, scope=scope)
 
     elif role == "Regulator":
+        # Oversight & SLA summary lines
+        lab = st.session_state.incident_labels.get(f"{incident_id(inc)}_{scope}") or {}
+        st.write(f"- Human oversight: {'Yes' if lab.get('ack') else 'No'} (ack / FP present)")
+        if lab.get('label_ts'):
+            dt = lab['label_ts'] - inc.get('ts', lab['label_ts'])
+            st.write(f"- Reviewed within 24h: {'Yes' if dt <= 24*3600 else 'No'}")
+        else:
+            st.write("- Reviewed within 24h: No")
+        
         st.markdown("**Assurance & governance**")
         st.write("- Calibrated confidence via conformal p-value (lower is stronger evidence).")
         st.write("- Audit trail available; no personal data—technical telemetry only.")
@@ -1493,30 +1533,7 @@ def render_incident_body_for_role(inc, role, scope="main"):
             data=json.dumps(_to_builtin(evidence), indent=2).encode("utf-8"),
             file_name=f"incident_{inc['device_id']}_{inc['ts']}_{inc['tick']}.json",
             mime="application/json",
-            key=f"dl_evidence_{base_key}"
-        )
-
-    elif role == "AI Builder":
-        st.markdown("**Model view**")
-        render_device_inspector_from_incident(inc, topk=8, scope=scope)
-        with st.expander("Standardized feature vector (z-values)"):
-            feats = inc.get("features") or st.session_state.last_features.get(inc["device_id"])
-            if feats:
-                X = pd.DataFrame([feats]).fillna(0.0)
-                cols = feature_cols_cached()
-                X = X.reindex(columns=cols, fill_value=0.0)
-                Xs = st.session_state.scaler.transform(X)
-                Xs_df = pd.DataFrame(Xs, columns=cols)
-                st.dataframe(Xs_df.T.rename(columns={0:"z"}), use_container_width=True)
-
-    else:  # Executive
-        st.markdown("**Executive summary**")
-        st.write(f"- Device **{inc['device_id']}** at risk: **{inc['severity']}**; scenario: **{inc['scenario']}**; type: **{inc.get('type_label','Unknown')}**.")
-        st.write("- Impact: transient performance/security risk; mitigations active.")
-        st.markdown("**KPIs**")
-        st.write("- Incidents, MTTD, Packet loss, Latency, SNR/SINR, Deauth/BLER")
-
-def render_incident_card(inc, role, scope="main"):
+     def render_incident_card(inc, role, scope="main"):
     base_key = f"{incident_id(inc)}_{scope}"
     pv = inc.get("p_value"); pv_str = f"{pv:.3f}" if pv is not None else "—"
     sev = inc.get("severity", "—")
@@ -1533,9 +1550,9 @@ def render_incident_card(inc, role, scope="main"):
         st.markdown("\n".join([f"- {_feature_label(_feature_base(x['feature']))}: impact {x['impact']:+.2f}" for x in concise]))
 
         if st.button("Acknowledge", key=f"ack_{base_key}"):
-            st.session_state.incident_labels[base_key] = {"ack": True, "false_positive": False}
+            st.session_state.incident_labels[base_key] = {"ack": True, "false_positive": False, "label_ts": int(time.time())}
         if st.button("Mark false positive", key=f"fp_{base_key}"):
-            st.session_state.incident_labels[base_key] = {"ack": True, "false_positive": True}
+            st.session_state.incident_labels[base_key] = {"ack": True, "false_positive": True, "label_ts": int(time.time())}
         label = st.session_state.incident_labels.get(base_key)
         if label:
             tag = "FALSE POSITIVE" if label.get("false_positive") else "ACKNOWLEDGED"
@@ -1833,6 +1850,33 @@ with tab_governance:
                 "Download audit log (incidents.json)",
                 data=json.dumps(audit_log_json(), indent=2).encode("utf-8"),
                 file_name="incidents_audit_log.json",
+                mime="application/json",
+                key=f"gov_dl_audit_json_{nonce}"
+            )
+        else:
+            st.caption("No incidents yet to export.")
+
+    st.markdown("### Model transparency")
+    mc = model_card_data()
+    st.json(mc, expanded=False)
+    st.download_button(
+        "Download model card (JSON)",
+        data=json.dumps(_to_builtin(mc), indent=2).encode("utf-8"),
+        file_name="model_card.json",
+        mime="application/json",
+        key=f"gov_dl_model_card_{nonce}"
+    )
+
+    st.markdown("## Training Explainer")
+    st.markdown(
+        "- **Data generation**: synthetic, physics-inspired telemetry (RF/QoS, GNSS, access/auth, integrity, cellular).  \n"
+        "- **Windows & features**: rolling window statistics (mean/std/min/max/last/slope/z/jump).  \n"
+        "- **Binary detector**: LightGBM, imbalance-aware; conformal p-values.  \n"
+        "- **Type head**: LightGBM multiclass + domain rules (fused), with calibrated confidence.  \n"
+        "- **Thresholding**: suggested threshold = max F1 on validation split."
+    )
+    _render_training_explainer(nonce)
+            file_name="incidents_audit_log.json",
                 mime="application/json",
                 key=f"gov_dl_audit_json_{nonce}"
             )
