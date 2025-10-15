@@ -209,14 +209,6 @@ with st.sidebar:
     show_heatmap = st.checkbox("Show fleet heatmap (metric z-scores)", True)
     type_filter = st.multiselect("Show device types", DEVICE_TYPES, default=DEVICE_TYPES)
     role = st.selectbox("Viewer role", ["End User", "Domain Expert", "Regulator", "AI Builder", "Executive"], index=3)
-# Apply role choice from Home cards, if set
-role_override = st.session_state.pop('home_set_role', None)
-if role_override:
-    # Streamlit selectbox doesn't allow programmatic selection directly post-creation;
-    # we reflect override with a small notice for this session.
-    st.success(f"Role set to: {role_override}")
-    role = role_override
-
 
     
     
@@ -242,10 +234,10 @@ st.markdown("---")
 st.caption("Tip: Change **Viewer role** to see a persona-tailored view.")
 st.divider()
 retrain = st.button("Train / Retrain models")
-with st.sidebar:
-    st.markdown("### Display options")
-    help_mode = st.checkbox("Help mode (inline hints)", True)
-    show_eu_status = st.checkbox("Show EU AI Act status banner", True)
+
+st.divider()
+help_mode = st.checkbox("Help mode (inline hints)", True)
+show_eu_status = st.checkbox("Show EU AI Act status banner", True)
 
 # Simple onboarding + EU status
 if help_mode:
@@ -1328,9 +1320,6 @@ def tick_once():
                 st.session_state.incidents.append(inc)
                 incidents_this_tick.append(inc)
 
-    if st.session_state.get('_run_once'):
-        st.session_state['_run_once'] = False
-        # No-op here; your existing loop will step naturally on next interaction
     if incidents_this_tick:
         affected = {i["device_id"] for i in incidents_this_tick}
         st.toast(f"{len(incidents_this_tick)} new incident(s) detected.", icon="🚨")
@@ -1724,138 +1713,19 @@ with k5:
 # =========================
 # Layout tabs
 # =========================
-tab_home, tab_overview, tab_fleet, tab_incidents, tab_insights, tab_governance = st.tabs(["Home", "Overview", "Fleet", "Incidents", "Insights", "Governance"])
+tab_overview, tab_fleet, tab_incidents, tab_insights, tab_governance = st.tabs(
+    ["Overview", "Fleet View", "Incidents", "Insights", "Governance"]
+)
 
 st.session_state.active_tab = None
 
 
-
-def render_home():
-    st.session_state.active_tab = 'home'
-    render_hero_header(
-        "Welcome",
-        "Pick your role, run a scenario, and review incidents. This guided home page helps you start fast.",
-        tips=[
-            "1) Choose your Viewer role above.",
-            "2) Select a Scenario and press ▶ Run.",
-            "3) Open Incidents for role-specific explanations.",
-            "4) See Insights for model-wide behavior; Governance for evidence."
-        ],
-        border=True
-    )
-    # Role cards
-    st.markdown("#### Who are you today?")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown("**End User**")
-        st.caption("Plain-language status & next steps.")
-        if st.button("Use End User view", key="home_role_user"):
-            st.session_state['home_set_role'] = "End User"
-    with c2:
-        st.markdown("**Executive**")
-        st.caption("Fleet KPIs, risk and trends first.")
-        if st.button("Use Executive view", key="home_role_exec"):
-            st.session_state['home_set_role'] = "Executive"
-    with c3:
-        st.markdown("**Domain Expert**")
-        st.caption("Signals, triage tools, SHAP inspector.")
-        if st.button("Use Expert view", key="home_role_expert"):
-            st.session_state['home_set_role'] = "Domain Expert"
-    c4, c5 = st.columns(2)
-    with c4:
-        st.markdown("**Regulator**")
-        st.caption("Assurance, conformity, audit evidence.")
-        if st.button("Use Regulator view", key="home_role_reg"):
-            st.session_state['home_set_role'] = "Regulator"
-    with c5:
-        st.markdown("**AI Builder**")
-        st.caption("Model calibration, margins, z-vectors.")
-        if st.button("Use AI Builder view", key="home_role_ai"):
-            st.session_state['home_set_role'] = "AI Builder"
-
-    # Getting started checklist
-    st.markdown("#### Getting started")
-    with st.container(border=True):
-        st.write("✅ Set your **Viewer role** (top-left).")
-        st.write("✅ Choose a **Scenario** and press **Run**.")
-        st.write("✅ Review **Incidents** (role-specific view).")
-        st.write("✅ Explore **Insights** (global behavior).")
-        st.write("✅ Check **Governance** (model/data transparency).")
-
-    # Recent activity (incidents summary)
-    incs = st.session_state.get("incidents", [])
-    st.markdown("#### Recent activity")
-    if not incs:
-        st.info("No incidents yet. Click ▶ Run to generate activity, or use the simulator in Incidents.")
-    else:
-        import pandas as pd, numpy as np, plotly.express as px
-        df = pd.DataFrame(incs).tail(50)
-        col1, col2 = st.columns(2)
-        with col1:
-            sev_counts = df["severity"].value_counts().reindex(["High","Medium","Low"]).fillna(0).astype(int)
-            pie_df = pd.DataFrame({"severity": sev_counts.index, "count": sev_counts.values})
-            fig = px.pie(pie_df, values="count", names="severity", title="Recent severity split")
-            st.plotly_chart(fig, use_container_width=True, key="home_sev_pie")
-        with col2:
-            df["when"] = pd.to_datetime(df["ts"], unit="s")
-            trend = df.groupby(df["when"].dt.floor("H")).size().reset_index(name="count")
-            fig = px.line(trend, x="when", y="count", markers=True, title="Incidents by hour (recent)")
-            st.plotly_chart(fig, use_container_width=True, key="home_trend_line")
-        st.dataframe(df[["ts","device_id","scenario","severity","prob","p_value"]].tail(10), use_container_width=True)
-
-    # Footer help
-    st.markdown("---")
-    st.caption("Tip: Need a safe demo? Use **End User** role + **What are these attack types?** expander in Incidents to simulate events.")
-
-# ---------- Home
-with tab_home:
-    render_home()
 # ---------- Overview
 with tab_overview:
     st.session_state.active_tab = 'overview'
-    render_hero_header("Home", "Your start page: status, KPIs & quick actions.", tips=["Pick a scenario and press ▶ Run.","Open Incidents for role-tailored explanations.","Use Insights for global behavior; Governance for transparency."], border=True)
+    render_hero_header("Overview", "Fleet health & key KPIs.", tips=["Watch severity and risk KPIs.","Use tabs to dive deeper.","Switch Viewer role to change the perspective."])
     left, right = st.columns([2,1])
 
-
-# Quick Actions
-qa1, qa2, qa3 = st.columns([1,1,1])
-with qa1:
-    if st.button("▶ Run 1 tick", key="home_run_tick"):
-        # Advance one tick if available
-        try:
-            st.session_state._run_once = True
-        except Exception:
-            pass
-with qa2:
-    if st.button("Train / Retrain models", key="home_train"):
-        st.session_state._trigger_train = True
-with qa3:
-    st.info("Open the **Incidents** tab to review detections (role-aware).")
-
-# KPI cards
-import numpy as np, pandas as pd
-devices_df = st.session_state.get("devices")
-n_devices = len(devices_df) if devices_df is not None else 0
-incs = st.session_state.get("incidents", [])
-auc = st.session_state.get("last_auc")
-fleet_prob = None
-base = st.session_state.get("baseline")
-if base is not None and len(base)>0:
-    try:
-        shap_mat = shap_pos(st.session_state.explainer, base)
-        # proxy risk = mean predicted prob if available in session; fallback to mean incident prob
-        fleet_prob = float(np.mean([i.get("prob", 0) for i in incs])) if incs else 0.0
-    except Exception:
-        fleet_prob = float(np.mean([i.get("prob", 0) for i in incs])) if incs else 0.0
-c1,c2,c3,c4 = st.columns(4)
-with c1:
-    st.metric("Devices", n_devices)
-with c2:
-    st.metric("Incidents (session)", len(incs))
-with c3:
-    st.metric("Model AUC", f"{auc:.3f}" if isinstance(auc,(int,float)) else "—")
-with c4:
-    st.metric("Fleet risk (mean prob)", f"{fleet_prob:.2f}" if fleet_prob is not None else "—")
     with left:
         if show_map and st.session_state.get("model") is not None:
             df_map = st.session_state.devices.copy()
