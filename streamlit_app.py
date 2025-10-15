@@ -242,10 +242,10 @@ st.markdown("---")
 st.caption("Tip: Change **Viewer role** to see a persona-tailored view.")
 st.divider()
 retrain = st.button("Train / Retrain models")
-
-st.divider()
-help_mode = st.checkbox("Help mode (inline hints)", True)
-show_eu_status = st.checkbox("Show EU AI Act status banner", True)
+with st.sidebar:
+    st.markdown("### Display options")
+    help_mode = st.checkbox("Help mode (inline hints)", True)
+    show_eu_status = st.checkbox("Show EU AI Act status banner", True)
 
 # Simple onboarding + EU status
 if help_mode:
@@ -1328,6 +1328,9 @@ def tick_once():
                 st.session_state.incidents.append(inc)
                 incidents_this_tick.append(inc)
 
+    if st.session_state.get('_run_once'):
+        st.session_state['_run_once'] = False
+        # No-op here; your existing loop will step naturally on next interaction
     if incidents_this_tick:
         affected = {i["device_id"] for i in incidents_this_tick}
         st.toast(f"{len(incidents_this_tick)} new incident(s) detected.", icon="🚨")
@@ -1721,9 +1724,7 @@ with k5:
 # =========================
 # Layout tabs
 # =========================
-tab_overview, tab_fleet, tab_incidents, tab_insights, tab_governance = st.tabs(
-    ["Overview", "Fleet View", "Incidents", "Insights", "Governance"]
-)
+tab_home, tab_overview, tab_fleet, tab_incidents, tab_insights, tab_governance = st.tabs(["Home", "Overview", "Fleet", "Incidents", "Insights", "Governance"])
 
 st.session_state.active_tab = None
 
@@ -1812,9 +1813,49 @@ with tab_home:
 # ---------- Overview
 with tab_overview:
     st.session_state.active_tab = 'overview'
-    render_hero_header("Overview", "Fleet health & key KPIs.", tips=["Watch severity and risk KPIs.","Use tabs to dive deeper.","Switch Viewer role to change the perspective."])
+    render_hero_header("Home", "Your start page: status, KPIs & quick actions.", tips=["Pick a scenario and press ▶ Run.","Open Incidents for role-tailored explanations.","Use Insights for global behavior; Governance for transparency."], border=True)
     left, right = st.columns([2,1])
 
+
+# Quick Actions
+qa1, qa2, qa3 = st.columns([1,1,1])
+with qa1:
+    if st.button("▶ Run 1 tick", key="home_run_tick"):
+        # Advance one tick if available
+        try:
+            st.session_state._run_once = True
+        except Exception:
+            pass
+with qa2:
+    if st.button("Train / Retrain models", key="home_train"):
+        st.session_state._trigger_train = True
+with qa3:
+    st.info("Open the **Incidents** tab to review detections (role-aware).")
+
+# KPI cards
+import numpy as np, pandas as pd
+devices_df = st.session_state.get("devices")
+n_devices = len(devices_df) if devices_df is not None else 0
+incs = st.session_state.get("incidents", [])
+auc = st.session_state.get("last_auc")
+fleet_prob = None
+base = st.session_state.get("baseline")
+if base is not None and len(base)>0:
+    try:
+        shap_mat = shap_pos(st.session_state.explainer, base)
+        # proxy risk = mean predicted prob if available in session; fallback to mean incident prob
+        fleet_prob = float(np.mean([i.get("prob", 0) for i in incs])) if incs else 0.0
+    except Exception:
+        fleet_prob = float(np.mean([i.get("prob", 0) for i in incs])) if incs else 0.0
+c1,c2,c3,c4 = st.columns(4)
+with c1:
+    st.metric("Devices", n_devices)
+with c2:
+    st.metric("Incidents (session)", len(incs))
+with c3:
+    st.metric("Model AUC", f"{auc:.3f}" if isinstance(auc,(int,float)) else "—")
+with c4:
+    st.metric("Fleet risk (mean prob)", f"{fleet_prob:.2f}" if fleet_prob is not None else "—")
     with left:
         if show_map and st.session_state.get("model") is not None:
             df_map = st.session_state.devices.copy()
