@@ -40,7 +40,7 @@ np.random.seed(CFG.seed)
 
 
 # =========================
-# Helper math
+# Helper utils
 # =========================
 def meters_to_latlon_offset(d_north_m: float, d_east_m: float, lat0: float):
     dlat = d_north_m / 111_111.0
@@ -53,6 +53,10 @@ def random_point_in_disc(lat0: float, lon0: float, r_m: int):
     dN, dE = rho * math.cos(theta), rho * math.sin(theta)
     dlat, dlon = meters_to_latlon_offset(dN, dE, lat0)
     return lat0 + dlat, lon0 + dlon
+
+def safe_columns(df: pd.DataFrame, cols: list[str]) -> list[str]:
+    """Return only columns that exist in df—prevents KeyError if older state is missing fields."""
+    return [c for c in cols if c in df.columns]
 
 
 # =========================
@@ -194,7 +198,7 @@ def incident_json(inc: dict) -> str:
         "severity": inc["severity"],
         "probability": float(inc["prob"]),
         "p_value": None if inc.get("p_value") is None else float(inc["p_value"]),
-        "model_version": CFG.model_version,
+        "model_version": inc.get("model_version", CFG.model_version),
         "explanation": {
             "plain": plain_english_summary(inc),
             "type_reason": build_type_explanation(inc),
@@ -243,7 +247,6 @@ def init_state():
     if "latest_probs" not in st.session_state:
         st.session_state.latest_probs = {}
     if "audit_log" not in st.session_state:
-        # each entry: {incident_id, decision, role, decided_at, created_at}
         st.session_state.audit_log = []
 
 init_state()
@@ -328,7 +331,7 @@ for _, r in new_incidents.iterrows():
         tick=r["tick"], device_id=r["device_id"], scenario=r["scenario"],
         type_label=r["type_label"], prob=float(r["prob"]),
         p_value=(None if pd.isna(r["p_value"]) else float(r["p_value"])),
-        severity=r["severity"], model_version=r["model_version"]
+        severity=r["severity"], model_version=r.get("model_version", CFG.model_version)
     ))
 
 st.session_state.tick += 1
@@ -406,11 +409,12 @@ with tab_overview:
         use_container_width=True
     )
 
-    # Fleet snapshot
+    # Fleet snapshot (SAFE columns)
     st.markdown("### Fleet snapshot")
+    cols = ["device_id","type","prob","p_value","type_label","severity","model_version"]
     st.dataframe(
-        now_records[["device_id","type","prob","p_value","type_label","severity","model_version"]]
-        .sort_values("prob", ascending=False)
+        now_records[safe_columns(now_records, cols)]
+        .sort_values(by=[c for c in ["prob"] if c in now_records.columns], ascending=False)
         .reset_index(drop=True),
         use_container_width=True, height=420
     )
@@ -471,12 +475,15 @@ with tab_incidents:
         mask = df_all["severity"].isin(sev_sel) & df_all["type_label"].isin(type_sel) & df_all["device_id"].isin(dev_sel)
         df_f = df_all.loc[mask].sort_values("tick")
 
-        st.dataframe(
-            df_f.assign(when=df_f["tick"].dt.strftime("%H:%M:%S")).rename(columns={
-                "id":"Incident","when":"Time (UTC)","device_id":"Device","type_label":"Type","prob":"Prob."
-            })[["Incident","Time (UTC)","Device","scenario","Type","severity","Prob.","p_value","model_version"]],
-            use_container_width=True, height=360
-        )
+        # SAFE columns for the incident list
+        base_cols = ["id","tick","device_id","scenario","type_label","severity","prob","p_value","model_version"]
+        show_cols = safe_columns(df_f, base_cols)
+        rename_map = {"id":"Incident","tick":"Time (UTC)","device_id":"Device","type_label":"Type","prob":"Prob."}
+        df_show = df_f[show_cols].rename(columns=rename_map)
+        if "Time (UTC)" in df_show.columns:
+            df_show["Time (UTC)"] = pd.to_datetime(df_show["Time (UTC)"]).dt.strftime("%H:%M:%S")
+
+        st.dataframe(df_show, use_container_width=True, height=360)
 
         if not df_f.empty:
             sel = st.selectbox("Open incident", df_f["id"].tolist(), index=len(df_f)-1)
@@ -539,7 +546,6 @@ with tab_incidents:
                 st.write("- Correlate with neighbor devices in ~100 m radius.")
                 st.write("- If persistent, escalate to spectrum capture.")
                 st.markdown("#### Local model factors")
-                # Lightweight "impacts" placeholder
                 rng = np.random.default_rng(abs(hash(inc["id"]))%(2**32))
                 feats = [f"f{i}" for i in range(1,21)]
                 vals  = rng.uniform(-1.5, 1.5, size=len(feats))
@@ -554,7 +560,7 @@ with tab_incidents:
                 meta = {
                     "Incident ID": inc["id"], "Device": inc["device_id"], "Scenario": inc["scenario"],
                     "Type": inc["type_label"], "Severity": inc["severity"], "Probability": inc["prob"],
-                    "p-value": inc["p_value"], "Model version": inc["model_version"],
+                    "p-value": inc["p_value"], "Model version": inc.get("model_version", CFG.model_version),
                     "Timestamp (UTC)": inc["tick"].strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 st.json(meta)
@@ -619,8 +625,8 @@ with tab_insights:
 
     # Compute decision metrics
     if not al.empty:
-        # Join created_at from incidents for completeness if missing
-        # (we already store created_at in audit entries)
+        al["decided_at"] = pd.to_datetime(al["decided_at"])
+        al["created_at"] = pd.to_datetime(al["created_at"])
         al["latency_sec"] = (al["decided_at"] - al["created_at"]).dt.total_seconds()
         decisions = len(al)
         confirms = (al["decision"] == "confirm").sum()
