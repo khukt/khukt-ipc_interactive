@@ -1,9 +1,9 @@
 # streamlit_app.py
-# TRUST DEMO — Map + Attack Injection + Persona-Aware Incidents + Governance (Charts)
+# TRUST DEMO — Map + Attack Injection + Persona-Aware Incidents + Governance (Full Cockpit)
 # Requires: streamlit, pandas, numpy, plotly, pydeck
 
 from __future__ import annotations
-import math, random, hashlib, json
+import math, random, hashlib, json, io, zipfile
 from dataclasses import dataclass
 from collections import deque
 from datetime import datetime, timedelta
@@ -28,7 +28,7 @@ class CFG:
     jam_radius_m: int = 220
     breach_radius_m: int = 180
     spoof_radius_m: int = 220
-    model_version: str = "demo-0.3.3"
+    model_version: str = "demo-0.4.0"
 
 random.seed(CFG.seed)
 np.random.seed(CFG.seed)
@@ -48,8 +48,8 @@ def random_point_in_disc(lat0: float, lon0: float, r_m: int):
 def safe_columns(df: pd.DataFrame, cols: list[str]) -> list[str]:
     return [c for c in cols if c in df.columns]
 
-def _download_bytes(text: str, filename: str, label: str, mime="text/plain"):
-    st.download_button(label, data=text.encode("utf-8"), file_name=filename, mime=mime)
+def _download_bytes(text: str, filename: str, label: str, mime="text/plain", key=None):
+    return st.download_button(label, data=text.encode("utf-8"), file_name=filename, mime=mime, key=key)
 
 # ---------------- Synthetic fleet ----------------
 TYPE_COLORS = {
@@ -77,7 +77,7 @@ def inject_attack_risk(row, scenario, jam_mode, breach_mode, spoof_scope, radii)
         R = radii["jam"]; core_boost = 0.55 if jam_mode=="Broadband noise" else (0.6 if jam_mode=="Reactive" else 0.5)
         if dist_m <= R: prob = base + core_boost*(1 - dist_m/R) + np.random.uniform(0,0.1); pval = np.clip(0.02+0.03*(dist_m/R)+np.random.uniform(-0.01,0.02),0.0005,0.2)
     elif scenario.startswith("Access Breach"):
-        R = radii["breach"]; lure = 0.50 if breach_mode=="Evil Twin" else (0.40 if breach_mode=="Rogue Open AP" else 0.35)
+        R = radii["breach"]; lure = 0.50 if breach_mode=="Evil Twin" else (0.40 if jam_mode!="Reactive" else 0.35)
         expo = 1.0 if row["type"] in ["AMR","Truck"] else 0.7
         if dist_m <= R: prob = base + expo*lure*(1 - 0.6*(dist_m/R)) + np.random.uniform(0,0.08); pval = np.clip(0.03 + 0.05*(dist_m/R), 0.001, 0.3)
     elif scenario.startswith("GPS Spoofing"):
@@ -168,6 +168,9 @@ def init_state():
     if "incidents" not in ss: ss.incidents = []
     if "latest_probs" not in ss: ss.latest_probs = {}
     if "audit_log" not in ss: ss.audit_log = []
+    ss.setdefault("gov_mc_done", False)
+    ss.setdefault("gov_ds_done", False)
+    ss.setdefault("gov_changes", [])
 
 def _init_gov_state():
     ss = st.session_state
@@ -196,6 +199,9 @@ def _init_gov_state():
         {"Role": "AI Builder", "Read Incidents": True, "Export": False, "Decide": False, "Admin": False},
         {"Role": "Admin", "Read Incidents": True, "Export": True, "Decide": True, "Admin": True},
     ]))
+    ss.setdefault("gov_last_thresh", CFG.threshold)
+    ss.setdefault("gov_sla_minutes", 10)
+    ss.setdefault("gov_sbom_text", "")
 
 # ---------------- Sidebar ----------------
 st.set_page_config(page_title="TRUST DEMO", layout="wide")
@@ -259,7 +265,7 @@ with k3: st.metric("Fleet risk (mean prob)", f"{(np.mean(list(st.session_state.l
 with k4: st.metric("Incidents (session)", len(st.session_state.incidents))
 st.caption("🛈 Demo data is synthetic. Live deployments must ensure GDPR lawful basis, minimization, and NIS2-grade security.")
 
-# ---------------- TABS (DEFINE FIRST!) ----------------
+# ---------------- TABS ----------------
 tab_overview, tab_incidents, tab_insights, tab_governance = st.tabs(
     ["Overview", "Incidents", "Insights", "Governance"]
 )
@@ -351,16 +357,28 @@ with tab_incidents:
             sel = st.selectbox("Open incident", df_f["id"].tolist(), index=len(df_f)-1)
             inc = df_f[df_f["id"]==sel].iloc[0].to_dict()
             st.markdown("---"); st.markdown(f"### {inc['id']} — {inc['device_id']}"); st.caption(inc["tick"].strftime("%Y-%m-%d %H:%M:%S UTC"))
+
+            # --- RBAC enforcement
+            can_decide = False
+            try:
+                rm = st.session_state.gov_role_matrix
+                can_decide = bool(rm.loc[rm["Role"]==role, "Decide"].values[0])
+            except Exception:
+                can_decide = (role in ["Executive","Domain Expert","Admin"])
+
             dc1, dc2, dc3 = st.columns([1,1,2])
-            with dc1:
-                if st.button("✅ Confirm", key=f"confirm_{inc['id']}"):
-                    st.session_state.audit_log.append({"incident_id": inc["id"], "decision": "confirm", "role": role, "decided_at": datetime.utcnow(), "created_at": inc["tick"]})
-                    st.success("Decision logged: confirm")
-            with dc2:
-                if st.button("✖️ Dismiss", key=f"dismiss_{inc['id']}"):
-                    st.session_state.audit_log.append({"incident_id": inc["id"], "decision": "dismiss", "role": role, "decided_at": datetime.utcnow(), "created_at": inc["tick"]})
-                    st.warning("Decision logged: dismiss")
-            with dc3: st.caption("All decisions are recorded for audit and compliance metrics.")
+            if can_decide:
+                with dc1:
+                    if st.button("✅ Confirm", key=f"confirm_{inc['id']}"):
+                        st.session_state.audit_log.append({"incident_id": inc["id"], "decision": "confirm", "role": role, "decided_at": datetime.utcnow(), "created_at": inc["tick"]})
+                        st.success("Decision logged: confirm")
+                with dc2:
+                    if st.button("✖️ Dismiss", key=f"dismiss_{inc['id']}"):
+                        st.session_state.audit_log.append({"incident_id": inc["id"], "decision": "dismiss", "role": role, "decided_at": datetime.utcnow(), "created_at": inc["tick"]})
+                        st.warning("Decision logged: dismiss")
+                with dc3: st.caption("All decisions are recorded for audit and compliance metrics.")
+            else:
+                with dc1: st.warning("Your role cannot confirm or dismiss incidents.")
 
             if role == "End User":
                 st.markdown("#### What’s happening (simple)"); st.markdown(plain_english_summary(inc))
@@ -428,11 +446,12 @@ with tab_insights:
             st.dataframe(view[["incident_id","decision","role","created_at","decided_at"]], use_container_width=True, height=260)
     else: st.info("No human decisions yet. Confirm or dismiss an incident to populate compliance KPIs.")
 
-# ---------------- Governance (Charts++) ----------------
+# ---------------- Governance (Full Cockpit) ----------------
 with tab_governance:
     _init_gov_state(); ss = st.session_state
     st.header("Governance, Transparency & Compliance")
 
+    # --- Scoring function
     def compute_scores():
         controls = ss.gov_controls; di = ss.gov_data_inventory; al = pd.DataFrame(ss.audit_log)
         data_transparency = 0
@@ -453,7 +472,7 @@ with tab_governance:
 
     subtabs = st.tabs(["Overview","Controls & Roles","Data & Privacy","Model & Datasets","Risk Register","Audit & Exports","Ops Settings"])
 
-    # Overview
+    # ===== Overview =====
     with subtabs[0]:
         c1,c2,c3,c4 = st.columns(4)
         c1.metric("Model version", CFG.model_version)
@@ -462,6 +481,7 @@ with tab_governance:
         al_df = pd.DataFrame(ss.audit_log) if ss.audit_log else pd.DataFrame()
         c3.metric("Decisions logged", 0 if al_df.empty else len(al_df))
         c4.metric("Controls enabled", sum(bool(v) for v in ss.gov_controls.values()))
+        # Radar + coverage
         colA, colB = st.columns([2,1], gap="large")
         with colA:
             cats = ["Data Transparency","Model Transparency","Human Oversight","Robustness","Traceability","Privacy"]
@@ -470,18 +490,34 @@ with tab_governance:
             fig_radar.add_trace(go.Scatterpolar(r=vals, theta=cats, fill="toself", name="Score"))
             fig_radar.update_layout(title="Compliance Dimensions (0–100)", polar=dict(radialaxis=dict(visible=True, range=[0,100])), showlegend=False)
             st.plotly_chart(fig_radar, use_container_width=True)
+            # Governance Scorecard (0–5) + Top gaps
+            weights = {k:1 for k in cats}
+            maturity = {k: int(round(scores[k]/20)) for k in weights}  # 0..5
+            score_total = int(round(np.average(list(maturity.values()), weights=list(weights.values())),0))
+            st.metric("Governance maturity (0–5)", f"{score_total}/5")
+            st.markdown("#### Top gaps to close")
+            gaps = sorted(maturity.items(), key=lambda kv: kv[1])[:3]
+            for k,v in gaps:
+                st.write(f"- **{k}** at level **{v}/5** → add 1–2 controls or evidence exports to reach 4/5.")
         with colB:
             enabled = sum(1 for v in ss.gov_controls.values() if v); disabled = len(ss.gov_controls) - enabled
             st.plotly_chart(px.bar(pd.DataFrame({"Status":["Enabled","Disabled"],"Count":[enabled,disabled]}),
                                    x="Status", y="Count", title="Controls coverage"), use_container_width=True)
-        st.markdown("#### Human decisions over time")
-        if not al_df.empty:
-            tl = al_df.copy(); tl["minute"] = pd.to_datetime(tl["decided_at"]).dt.floor("T")
-            line = tl.groupby("minute").size().reset_index(name="decisions")
-            st.plotly_chart(px.line(line, x="minute", y="decisions", markers=True, title="Decision timeline"), use_container_width=True)
-        else: st.info("No decisions yet. Confirm or dismiss an incident to populate this chart.")
+        # SLA compliance for human oversight
+        ss.gov_sla_minutes = st.slider("Decision SLA (minutes)", 1, 120, ss.gov_sla_minutes, 1, key="gov_sla_minutes")
+        al_df = pd.DataFrame(st.session_state.audit_log); di_df = pd.DataFrame(st.session_state.incidents)
+        if not al_df.empty and not di_df.empty:
+            latest = al_df.sort_values("decided_at").groupby("incident_id").tail(1)
+            j = latest.merge(di_df[["id","tick"]], left_on="incident_id", right_on="id", how="left")
+            j["latency_min"] = (pd.to_datetime(j["decided_at"]) - pd.to_datetime(j["tick"])).dt.total_seconds()/60.0
+            sla_ok = (j["latency_min"] <= ss.gov_sla_minutes).mean() if len(j) else np.nan
+            st.metric("SLA compliance", f"{(sla_ok*100):.0f}%" if sla_ok==sla_ok else "—")
+            st.plotly_chart(px.histogram(j, x="latency_min", nbins=20, title="Decision latency distribution (min)"),
+                            use_container_width=True)
+        else:
+            st.info("No decisions yet for SLA analysis.")
 
-    # Controls & Roles
+    # ===== Controls & Roles =====
     with subtabs[1]:
         st.subheader("Controls checklist")
         cols = st.columns(4); keys=list(ss.gov_controls.keys())
@@ -491,7 +527,7 @@ with tab_governance:
         rm = ss.gov_role_matrix.copy(); bool_cols=[c for c in rm.columns if c!="Role"]; mat=rm[bool_cols].astype(int)
         st.plotly_chart(px.imshow(mat, text_auto=True, aspect="auto", x=bool_cols, y=rm["Role"], title="Permissions (1=yes)"), use_container_width=True)
 
-    # Data & Privacy
+    # ===== Data & Privacy =====
     with subtabs[2]:
         st.subheader("Data Inventory & Transparency")
         st.dataframe(ss.gov_data_inventory, use_container_width=True, height=240)
@@ -511,6 +547,7 @@ with tab_governance:
                                   go.Bar(name="Recommended", x=rec_df["Artifact"], y=rec_df["Recommended"])])
         fig_ret.update_layout(barmode="group", title="Retention: configured vs recommended")
         st.plotly_chart(fig_ret, use_container_width=True)
+        # DPIA draft
         dpiamd = f"""# DPIA (Draft Template)
 **Scope**: Site anomaly screening (RF, access, GNSS, integrity).
 **Controller**: Your Org • **Model version**: {CFG.model_version}
@@ -520,15 +557,29 @@ with tab_governance:
 **Mitigations**: Human oversight, threshold tuning, monitoring, retraining, secure transport, retention {ss.gov_retention_days_incidents} days.
 **Rights & safeguards**: Access, rectification, deletion; privacy by design; pseudonymization: {"ON" if ss.gov_pseudonymization else "OFF"}.
 """
-        _download_bytes(dpiamd, "DPIA_draft.md", "⬇️ Download DPIA (draft)")
+        _download_bytes(dpiamd, "DPIA_draft.md", "⬇️ Download DPIA (draft)", key="dl_dpia")
+        # ROPA
+        st.markdown("#### ROPA (Record of Processing Activities)")
+        ropa = {
+            "Controller": "Your Org",
+            "Purpose": "Operational security / anomaly screening",
+            "Categories of data": "Technical telemetry; no PII by design",
+            "Recipients": "Security/Ops team; auditors",
+            "Retention": f"{ss.gov_retention_days_incidents} days (incidents); telemetry per inventory",
+            "Safeguards": "Transport security; pseudonymization; access controls; audit logs",
+        }
+        st.json(ropa)
+        _download_bytes(json.dumps(ropa, indent=2), "ROPA.json", "⬇️ Download ROPA", mime="application/json", key="dl_ropa")
 
-    # Model & Datasets
+    # ===== Model & Datasets =====
     with subtabs[3]:
         st.subheader("Model Transparency & Dataset Cards")
+        # Transparency bars
         mt = scores["Model Transparency"]; dt = scores["Data Transparency"]
         cA,cB = st.columns(2)
         with cA: st.plotly_chart(px.bar(pd.DataFrame({"Metric":["Model Transparency"],"Score":[mt]}), x="Metric", y="Score", range_y=[0,100], title="Model Transparency (0–100)"), use_container_width=True)
         with cB: st.plotly_chart(px.bar(pd.DataFrame({"Metric":["Data Transparency"],"Score":[dt]}), x="Metric", y="Score", range_y=[0,100], title="Data Transparency (0–100)"), use_container_width=True)
+        # Data lineage Sankey
         st.markdown("#### Data Lineage (demo)")
         nodes=["Devices","Telemetry (synthetic)","Anomaly Engine","Incidents","Exports (JSON/MD)","Audit Log"]; nmap={n:i for i,n in enumerate(nodes)}
         links=dict(source=[nmap["Devices"],nmap["Telemetry (synthetic)"],nmap["Anomaly Engine"],nmap["Anomaly Engine"],nmap["Incidents"]],
@@ -538,7 +589,22 @@ with tab_governance:
                                            link=dict(source=links["source"], target=links["target"], value=links["value"]))])
         fig_sk.update_layout(title_text="Data Flow: Sources → Processing → Outputs", font_size=12)
         st.plotly_chart(fig_sk, use_container_width=True)
-        st.markdown("#### Model Card"); mc = f"""# Model Card — TRUST DEMO
+        # Drift indicators
+        fr = pd.DataFrame(list(st.session_state.fleet_records))
+        if not fr.empty:
+            fr = fr.sort_values("tick"); mid = int(len(fr)*0.5)
+            early = fr.iloc[:mid]["prob"].mean() if mid>0 else np.nan
+            recent = fr.iloc[mid:]["prob"].mean() if mid>0 else np.nan
+            st.metric("Drift (Δ mean prob)", f"{(recent - early):.2f}" if (early==early and recent==recent) else "—")
+            fr["minute"] = pd.to_datetime(fr["tick"]).dt.floor("T")
+            minute_mean = fr.groupby("minute")["prob"].mean().reset_index()
+            st.plotly_chart(px.line(minute_mean, x="minute", y="prob", title="Mean probability trend (proxy for drift)"),
+                            use_container_width=True)
+        else:
+            st.caption("Drift: not enough data yet.")
+        # Model Card & Datasheet (set flags when downloaded)
+        st.markdown("#### Model Card")
+        mc = f"""# Model Card — TRUST DEMO
 **Version**: {CFG.model_version}
 **Intended use**: Site-level anomaly screening; advisory only.
 **Limits**: Not for autonomous enforcement or user surveillance.
@@ -546,17 +612,23 @@ with tab_governance:
 **Evaluation**: Threshold-based; qualitative expert review.
 **Ethical considerations**: Human-in-the-loop, transparency, contestability.
 """
-        st.code(mc, language="markdown"); _download_bytes(mc, f"model_card_{CFG.model_version}.md", "⬇️ Model Card (MD)")
-        st.markdown("#### Datasheet for Datasets"); ds = """# Datasheet — Telemetry (synthetic)
+        st.code(mc, language="markdown")
+        clicked_mc = _download_bytes(mc, f"model_card_{CFG.model_version}.md", "⬇️ Model Card (MD)", key="dl_model_card")
+        if clicked_mc: ss.gov_mc_done = True
+
+        st.markdown("#### Datasheet for Datasets")
+        ds = """# Datasheet — Telemetry (synthetic)
 **Composition**: Synthetic RF/access/GNSS/integrity proxies.
 **Collection**: Procedural generation; no user data.
 **Preprocessing**: Normalization & signal proxies.
 **Uses**: Demo/training of anomaly screens.
 **Distribution**: Internal demo only.
 """
-        st.code(ds, language="markdown"); _download_bytes(ds, "datasheet_telemetry_synthetic.md", "⬇️ Datasheet (MD)")
+        st.code(ds, language="markdown")
+        clicked_ds = _download_bytes(ds, "datasheet_telemetry_synthetic.md", "⬇️ Datasheet (MD)", key="dl_datasheet")
+        if clicked_ds: ss.gov_ds_done = True
 
-    # Risk Register
+    # ===== Risk Register =====
     with subtabs[4]:
         st.subheader("Risk Register"); st.dataframe(ss.gov_risk_register, use_container_width=True, height=280)
         with st.expander("Add new risk"):
@@ -565,9 +637,9 @@ with tab_governance:
             if st.button("Add risk") and new_risk:
                 ss.gov_risk_register = pd.concat([ss.gov_risk_register, pd.DataFrame([{"Risk":new_risk,"Severity":new_sev,"Likelihood":new_lik,"Mitigation":new_mit or "TBD","Owner":new_owner or "TBD","Status":"New"}])], ignore_index=True)
                 st.success("Risk added.")
-        _download_bytes(ss.gov_risk_register.to_csv(index=False), "risk_register.csv", "⬇️ Export CSV", mime="text/csv")
+        _download_bytes(ss.gov_risk_register.to_csv(index=False), "risk_register.csv", "⬇️ Export CSV", mime="text/csv", key="dl_risk")
 
-    # Audit & Exports
+    # ===== Audit & Exports =====
     with subtabs[5]:
         st.subheader("Audit Trail & Evidence")
         di_all=pd.DataFrame(ss.incidents) if ss.incidents else pd.DataFrame()
@@ -580,17 +652,118 @@ with tab_governance:
                 av=al_all.copy(); av["created_at"]=pd.to_datetime(av["created_at"]).dt.strftime("%Y-%m-%d %H:%M:%S"); av["decided_at"]=pd.to_datetime(av["decided_at"]).dt.strftime("%Y-%m-%d %H:%M:%S")
                 st.dataframe(av, use_container_width=True, height=250)
             else: st.info("No human decisions logged yet.")
-        st.markdown("#### Bulk Exports")
-        _download_bytes(di_all.to_csv(index=False) if not di_all.empty else "", "incidents.csv", "⬇️ Incidents (CSV)", mime="text/csv")
-        _download_bytes(di_all.to_json(orient="records", indent=2) if not di_all.empty else "[]", "incidents.json", "⬇️ Incidents (JSON)", mime="application/json")
-        _download_bytes(al_all.to_csv(index=False) if not al_all.empty else "", "audit_log.csv", "⬇️ Audit Log (CSV)", mime="text/csv")
-        _download_bytes(al_all.to_json(orient="records", indent=2) if not al_all.empty else "[]", "audit_log.json", "⬇️ Audit Log (JSON)", mime="application/json")
+        # Evidence bundle & digest
+        bundle = {
+            "model_version": CFG.model_version,
+            "incidents": di_all.to_dict("records"),
+            "decisions": al_all.to_dict("records"),
+        }
+        digest = hashlib.sha256(json.dumps(bundle, sort_keys=True, default=str).encode()).hexdigest()
+        st.info(f"Session Evidence Digest: `{digest}`")
+        _download_bytes(json.dumps(bundle, indent=2, default=str), "evidence_bundle.json", "⬇️ Evidence bundle (JSON)", mime="application/json", key="dl_bundle")
 
-    # Ops Settings
+        # SBOM (supply chain)
+        st.subheader("Software Bill of Materials (SBOM)")
+        ss.gov_sbom_text = st.text_area("Paste SBOM (CycloneDX/SPDX) or notes", height=120,
+                                        placeholder="e.g., component list, versions, known CVEs, remediation plans",
+                                        value=ss.gov_sbom_text)
+        _download_bytes(ss.gov_sbom_text or "# SBOM\n\n(placeholder)", "sbom.txt", "⬇️ Export SBOM", key="dl_sbom")
+
+        # Conformity Assessment Checklist with progress
+        st.markdown("### Conformity Assessment Readiness")
+        items = {
+            "Model Card generated": bool(ss.gov_mc_done),
+            "Datasheet generated": bool(ss.gov_ds_done),
+            "DPIA drafted": True,
+            "Audit log enabled": True,
+            "Role Matrix defined": True,
+            "Export hashing displayed": True,
+        }
+        progress = int(100*sum(items.values())/len(items))
+        st.progress(progress/100.0, text=f"{progress}% complete")
+        with st.expander("Checklist details"):
+            for k,v in items.items(): st.write(f"- [{'x' if v else ' '}] {k}")
+
+        # One-click Regulatory Report (ZIP)
+        st.markdown("### Regulatory Report (ZIP)")
+        # Compose artifacts
+        dpiamd_txt = ss.get("dpiamd_cached") or ""  # optional
+        mc_txt = f"# Model Card — TRUST DEMO\n\nVersion: {CFG.model_version}\n\n" + ""  # we already have mc above
+        ds_txt = "# Datasheet — Telemetry (synthetic)\n\n(see datasheet export above)\n"
+        rr_csv = ss.gov_risk_register.to_csv(index=False) if not ss.gov_risk_register.empty else ""
+        incidents_json = di_all.to_json(orient="records", indent=2, date_format="iso") if not di_all.empty else "[]"
+        audit_json = al_all.to_json(orient="records", indent=2, date_format="iso") if not al_all.empty else "[]"
+        ropa_json = json.dumps({
+            "Controller": "Your Org",
+            "Purpose": "Operational security / anomaly screening",
+            "Categories of data": "Technical telemetry; no PII by design",
+            "Recipients": "Security/Ops team; auditors",
+            "Retention": f"{ss.gov_retention_days_incidents} days (incidents); telemetry per inventory",
+            "Safeguards": "Transport security; pseudonymization; access controls; audit logs",
+        }, indent=2)
+        bundle_json = json.dumps(bundle, indent=2, default=str)
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("model_card.md", mc)
+            z.writestr("datasheet.md", ds)
+            z.writestr("DPIA_draft.md", dpiamd)
+            z.writestr("risk_register.csv", rr_csv)
+            z.writestr("incidents.json", incidents_json)
+            z.writestr("audit_log.json", audit_json)
+            z.writestr("evidence_bundle.json", bundle_json)
+            z.writestr("ROPA.json", ropa_json)
+            z.writestr("SBOM.txt", ss.gov_sbom_text or "(placeholder)")
+            z.writestr("SESSION_DIGEST.txt", f"SHA-256(bundle) = {digest}\n")
+        st.download_button("⬇️ Download Regulatory Report (ZIP)", data=buf.getvalue(), file_name="regulatory_report.zip", mime="application/zip", key="dl_zip")
+
+    # ===== Ops Settings =====
     with subtabs[6]:
         st.subheader("Operational Settings (affect governance artifacts)")
-        c1,c2,c3=st.columns(3)
-        with c1: ss.gov_log_level = st.selectbox("Log level", ["Debug","Info","Warning","Error"], index=["Debug","Info","Warning","Error"].index(ss.gov_log_level))
-        with c2: ss.gov_hash_algo = st.selectbox("Evidence hash", ["SHA-256","SHA-512"], index=0 if ss.gov_hash_algo=="SHA-256" else 1)
-        with c3: _ = st.slider("Default incident threshold (reference)", 0.30, 0.95, float(CFG.threshold), 0.01)
-        st.write("Changes reflect in DPIA, Model Card, and evidence context.")
+        c1,c2,c3 = st.columns(3)
+        with c1:
+            old_log = ss.gov_log_level
+            new_log = st.selectbox("Log level", ["Debug","Info","Warning","Error"],
+                                   index=["Debug","Info","Warning","Error"].index(old_log))
+            if new_log != old_log:
+                ss.gov_changes.append({"when": datetime.utcnow(), "what": "log_level", "from": old_log, "to": new_log})
+                ss.gov_log_level = new_log
+        with c2:
+            old_hash = ss.gov_hash_algo
+            new_hash = st.selectbox("Evidence hash", ["SHA-256","SHA-512"], index=0 if old_hash=="SHA-256" else 1)
+            if new_hash != old_hash:
+                ss.gov_changes.append({"when": datetime.utcnow(), "what": "evidence_hash", "from": old_hash, "to": new_hash})
+                ss.gov_hash_algo = new_hash
+        with c3:
+            old_thresh = ss.gov_last_thresh
+            new_thresh = st.slider("Reference threshold (governance)", 0.30, 0.95, float(old_thresh), 0.01)
+            if new_thresh != old_thresh:
+                ss.gov_changes.append({"when": datetime.utcnow(), "what": "threshold", "from": old_thresh, "to": new_thresh})
+                ss.gov_last_thresh = new_thresh
+
+        st.markdown("### Policy Pack")
+        pack = st.selectbox("Apply baseline", ["Custom","Operational","Strict","Research"], index=0)
+        if st.button("Apply"):
+            packs = {
+              "Operational": dict(human_oversight=True, transparency_cards=True, traceability_audit=True,
+                                  data_minimization=True, privacy_by_design=True, security_transport=True,
+                                  robustness_eval=True, lifecycle_mgmt=True),
+              "Strict": dict(human_oversight=True, transparency_cards=True, traceability_audit=True,
+                             data_minimization=True, privacy_by_design=True, security_transport=True,
+                             robustness_eval=True, lifecycle_mgmt=True),
+              "Research": dict(human_oversight=True, transparency_cards=True, traceability_audit=True,
+                               data_minimization=False, privacy_by_design=True, security_transport=True,
+                               robustness_eval=True, lifecycle_mgmt=False),
+            }
+            if pack!="Custom":
+                ss.gov_controls.update(packs[pack])
+                ss.gov_changes.append({"when": datetime.utcnow(), "what": "policy_pack", "from": "Custom", "to": pack})
+                st.success(f"Applied {pack} policy pack.")
+
+        with st.expander("Change log"):
+            ch = pd.DataFrame(ss.gov_changes)
+            if not ch.empty:
+                ch["when"] = pd.to_datetime(ch["when"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+                st.dataframe(ch, use_container_width=True, height=200)
+            else:
+                st.caption("No changes recorded yet.")
