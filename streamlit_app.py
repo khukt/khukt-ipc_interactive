@@ -1,12 +1,10 @@
-# streamlit_app.py — Compact UI v2 for TRUST AI Wireless Threats
+# streamlit_app.py — Compact UI v2.1 for TRUST AI Wireless Threats
 # ---------------------------------------------------------------
-# Drop-in simplified layout that reduces scrolling and cognitive load.
-# It is **runnable as-is** (uses lightweight synthetic data + placeholders),
-# but exposes clear hooks so you can plug your existing training/SHAP logic.
+# Drop-in simplified layout with richer content per tab, persona-aware hints,
+# and a brighter map style. Safe placeholders are provided; swap hooks with your
+# real model/training/SHAP logic as needed.
 #
 # Usage: streamlit run streamlit_app.py
-#
-# Dependencies: streamlit, pandas, numpy, plotly, pydeck, shap, scikit-learn, lightgbm
 
 from __future__ import annotations
 import json
@@ -15,6 +13,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 import pydeck as pdk
 
 # -------------------------
@@ -27,14 +26,20 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Minimal theming helpers
 PRIMARY = "#0F766E"  # teal-700
-MUTED = "#6B7280"    # gray-500
 ACCENT = "#2563EB"   # blue-600
 
+# Persona guidance (role-aware short tips)
+ROLE_TIPS = {
+    "End User": "Focus on the Incidents tab. Use the guidance box to see what to do next.",
+    "Domain Expert": "Open Insights → Feature importance and calibration. Inspect per-incident SHAP when available.",
+    "Regulator": "Go to Governance for model card, audit log, policy & evidence downloads.",
+    "AI Builder": "Use Insights to retrain/tune thresholds and export artifacts.",
+    "Executive": "Glance KPIs on Overview; check trend sparkline and incident counts.",
+}
+
 # -------------------------
-# Mock / lightweight data generators (safe defaults for demo)
-# Replace these with your real back-end functions if available.
+# Lightweight data generators (replace with back-end in production)
 # -------------------------
 @st.cache_data(show_spinner=False)
 def get_device_inventory(n_devices: int = 30, seed: int = 7) -> pd.DataFrame:
@@ -43,19 +48,17 @@ def get_device_inventory(n_devices: int = 30, seed: int = 7) -> pd.DataFrame:
     base_lat, base_lon = 62.3908, 17.3069  # Sundsvall approx
     lats = base_lat + rng.normal(0, 0.02, n_devices)
     lons = base_lon + rng.normal(0, 0.04, n_devices)
-    df = pd.DataFrame({
+    return pd.DataFrame({
         "device_id": [f"dev_{i:03d}" for i in range(n_devices)],
         "type": types,
         "lat": lats,
         "lon": lons,
     })
-    return df
 
 @st.cache_data(show_spinner=False)
 def get_incidents(devices: pd.DataFrame, scenario: str, risk_thr: float) -> pd.DataFrame:
     rng = np.random.default_rng(42 if scenario == "Normal" else 21)
     n = len(devices)
-    # risk ~ baseline + scenario bump
     base = rng.beta(1.5, 4.0, n)
     bump = {
         "Normal": 0.0,
@@ -69,22 +72,43 @@ def get_incidents(devices: pd.DataFrame, scenario: str, risk_thr: float) -> pd.D
     df = devices.copy()
     df["risk"] = risk
     df["type_pred"] = attack_type
-    df["p_value"] = 1 - risk  # pretend conformal p
+    df["p_value"] = np.clip(1 - risk, 0, 1)  # pretend conformal p
     df["is_incident"] = df["risk"] >= risk_thr
-    return df[df["is_incident"]].sort_values("risk", ascending=False).reset_index(drop=True)
+    # Derive confidence bucket
+    df["confidence"] = pd.cut(1 - df["p_value"], bins=[0, 0.6, 0.8, 1.01], labels=["low", "medium", "high"], include_lowest=True)
+    return df.sort_values("risk", ascending=False).reset_index(drop=True)
 
 @st.cache_data(show_spinner=False)
 def get_model_metrics(scenario: str) -> dict:
-    # Placeholder metrics
     base = {
-        "auc": 0.78,
+        "auc": 0.82 if scenario != "Normal" else 0.78,
+        "brier": 0.19,
         "fleet_risk": 0.33 if scenario == "Normal" else 0.55,
         "last_train_s": 4.2,
+        "version": "1.3.0",
     }
     return base
 
 # -------------------------
-# UI Builders
+# Helpers
+# -------------------------
+
+def risk_color(r: float) -> list[int]:
+    # green → yellow → red
+    if r < 0.33:
+        return [16, 185, 129, 120]
+    if r < 0.66:
+        return [234, 179, 8, 150]
+    return [239, 68, 68, 180]
+
+
+def persona_hint(role: str):
+    tip = ROLE_TIPS.get(role)
+    if tip:
+        st.caption(f"**{role} tip:** {tip}")
+
+# -------------------------
+# Sidebar
 # -------------------------
 
 def build_sidebar() -> dict:
@@ -116,7 +140,7 @@ def build_sidebar() -> dict:
     st.sidebar.divider()
     st.sidebar.subheader("Display & Access")
     show_map = st.sidebar.toggle("Show geospatial map", True)
-    show_heat = st.sidebar.toggle("Show fleet heatmap (z-scores)", False)
+    show_heat = st.sidebar.toggle("Show risk heatmap", True)
 
     st.sidebar.divider()
     st.sidebar.subheader("Viewer role")
@@ -140,16 +164,18 @@ def build_sidebar() -> dict:
         "eu": eu_banner,
     }
 
+# -------------------------
+# Header & Banners
+# -------------------------
 
 def header(role: str):
     st.title("TRUST AI — Wireless Threat Detection Demo")
     st.caption(
-        "AMR & logistics fleet • RF/network realism • LightGBM + SHAP • Conformal • Persona-aware explanations • Cached models"
+        "Fleet risk & incidents • LightGBM + SHAP • Conformal evidence • Persona-aware explanations • Cached models"
     )
-    # Compact role strip
     st.markdown(
-        f"<div style='background:{ACCENT}10;border:1px solid {ACCENT}33;padding:8px 12px;border-radius:10px'>"
-        f"<strong>Viewer role:</strong> {role} • <em>Overview, incidents, insights, governance</em>"
+        f"<div style='background:{ACCENT}10;border:1px solid {ACCENT}33;padding:10px 14px;border-radius:10px'>"
+        f"<strong>Viewer role:</strong> {role} • <em>Overview · Incidents · Insights · Governance</em>"
         "</div>",
         unsafe_allow_html=True,
     )
@@ -157,122 +183,232 @@ def header(role: str):
 
 def quick_help(help_on: bool):
     if help_on:
-        st.info("How to use: Pick a scenario → Watch KPIs → Open Incidents → See Insights → Check Governance.")
+        st.info("Flow: Pick scenario → Watch KPIs → Open Incidents → Drill into Insights → Review Governance.")
 
 
-def compact_banners(eu_on: bool, scenario: str):
+def compact_banners(eu_on: bool):
     if eu_on:
         st.success(
-            "EU AI Act status: Limited/Minimal risk demo (synthetic telemetry; no safety control loop). "
-            "If integrated as a safety component or for critical infrastructure control, it may become High‑risk.",
+            "EU AI Act status: Minimal-risk demo (synthetic, not a safety control component). "
+            "Integration into safety/control may elevate risk class.",
             icon="✅",
         )
-    st.caption(
-        "Loaded cached model — no retraining needed. Use the **Train / Retrain** button in Insights if you change data.")
+    st.caption("Cached model active. Use **Train / Retrain** in Insights after data changes.")
 
+# -------------------------
+# KPI Row
+# -------------------------
 
 def kpi_row(devices_df: pd.DataFrame, incidents_df: pd.DataFrame, metrics: dict):
     dcount = len(devices_df)
-    icount = len(incidents_df)
+    icount = int((incidents_df["is_incident"]).sum())
     auc = metrics.get("auc", np.nan)
     frisk = metrics.get("fleet_risk", np.nan)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1])
     c1.metric("Devices", dcount)
     c2.metric("Incidents", icount)
     c3.metric("Model AUC", f"{auc:.2f}")
     c4.metric("Fleet Risk", f"{frisk:.2f}")
-
+    c5.metric("Model ver.", metrics.get("version", "—"))
 
 # -------------------------
-# Tab renderers
+# Tabs
 # -------------------------
 
-def tab_overview(devices: pd.DataFrame, incidents: pd.DataFrame, show_map: bool):
+def render_overview(devices: pd.DataFrame, incidents: pd.DataFrame, show_map: bool, show_heat: bool, role: str):
     st.subheader("Overview")
-    if show_map:
-        # Map with incidents overlay
-        if not devices.empty:
-            layer_all = pdk.Layer(
+    persona_hint(role)
+
+    if show_map and not devices.empty:
+        # Map style → brighter
+        try:
+            map_style = "mapbox://styles/mapbox/light-v9"
+        except Exception:
+            map_style = None
+
+        # Color per risk
+        devices_vis = devices.copy()
+        devices_vis["risk_color"] = devices_vis["risk"].fillna(0).apply(lambda r: risk_color(r)) if "risk" in devices_vis else [risk_color(0.2)]*len(devices_vis)
+
+        layers = [
+            pdk.Layer(
                 "ScatterplotLayer",
-                data=devices,
+                data=devices_vis,
                 get_position='[lon, lat]',
                 get_radius=60,
                 radius_min_pixels=2,
                 radius_max_pixels=20,
-                get_fill_color=[120, 120, 120, 80],
+                get_fill_color='risk_color',
                 pickable=True,
             )
-            layer_inc = pdk.Layer(
-                "ScatterplotLayer",
-                data=incidents,
-                get_position='[lon, lat]',
-                get_radius=80,
-                radius_min_pixels=3,
-                radius_max_pixels=30,
-                get_fill_color=[220, 50, 47, 160],
-                pickable=True,
+        ]
+        if show_heat:
+            layers.append(
+                pdk.Layer(
+                    "HeatmapLayer",
+                    data=incidents if not incidents.empty else devices,
+                    get_position='[lon, lat]',
+                    aggregation="MEAN",
+                    opacity=0.35,
+                )
             )
-            view_state = pdk.ViewState(latitude=devices["lat"].mean(), longitude=devices["lon"].mean(), zoom=11)
-            st.pydeck_chart(pdk.Deck(layers=[layer_all, layer_inc], initial_view_state=view_state, tooltip={"text": "{device_id}\nRisk: {risk}"}))
-        else:
-            st.warning("No device data available.")
+        view_state = pdk.ViewState(latitude=devices["lat"].mean(), longitude=devices["lon"].mean(), zoom=11)
+        st.pydeck_chart(pdk.Deck(
+            layers=layers,
+            initial_view_state=view_state,
+            tooltip={"text": "{device_id} ({type})
+Risk: {risk}"},
+            map_style=map_style,
+        ))
+    else:
+        st.warning("Map disabled or no data available.")
 
-    # Compact KPI sparkline (dummy)
-    hist = pd.DataFrame({"tick": np.arange(30), "fleet_risk": np.clip(np.cumsum(np.random.randn(30))*0.01+0.35, 0, 1)})
-    fig = px.area(hist, x="tick", y="fleet_risk", height=180, title="Fleet risk (last 30 ticks)")
-    fig.update_layout(margin=dict(l=0, r=0, t=30, b=0))
+    # Trend sparkline
+    hist = pd.DataFrame({"tick": np.arange(40), "fleet_risk": np.clip(np.cumsum(np.random.randn(40))*0.01+0.35, 0, 1)})
+    fig = px.area(hist, x="tick", y="fleet_risk", height=180, title="Fleet risk — last 40 ticks")
+    fig.update_layout(margin=dict(l=0, r=0, t=34, b=0))
     st.plotly_chart(fig, use_container_width=True)
 
 
-def tab_incidents(incidents: pd.DataFrame):
+def render_incidents(full_df: pd.DataFrame, thr: float, role: str):
     st.subheader("Incidents")
+    persona_hint(role)
+
+    incidents = full_df[full_df["is_incident"]]
     if incidents.empty:
-        st.success("No incidents above threshold. Adjust the threshold or switch scenario.")
+        st.success("No incidents above threshold. Lower the threshold or switch scenario.")
         return
-    # Compact table
-    show_cols = ["device_id", "type", "risk", "p_value", "type_pred"]
+
+    show_cols = ["device_id", "type", "risk", "p_value", "type_pred", "confidence"]
     grid = incidents[show_cols].copy()
     grid.rename(columns={"type": "device_type", "type_pred": "attack_type"}, inplace=True)
     st.dataframe(grid, use_container_width=True, hide_index=True)
 
+    # Inspector panel
+    sel = st.selectbox("Inspect device", options=incidents["device_id"].tolist())
+    row = incidents[incidents["device_id"] == sel].iloc[0]
 
-def tab_insights(metrics: dict):
+    c1, c2, c3 = st.columns([1,1,1])
+    c1.metric("Risk", f"{row.risk:.2f}")
+    c2.metric("Conformal p", f"{row.p_value:.2f}")
+    c3.metric("Confidence", str(row.confidence))
+
+    st.markdown("**Role-aware guidance**")
+    if role == "End User":
+        st.info("Move the asset to a safe zone and follow site SOP. If jamming suspected, avoid remote control.")
+    elif role == "Domain Expert":
+        st.info("Check RF telemetry (SNR/SINR, BLER) and access logs. Compare with baseline week-over-week.")
+    elif role == "Regulator":
+        st.info("Record this incident ID in the audit log and capture evidence bundle (governance tab).")
+    elif role == "AI Builder":
+        st.info("Validate threshold vs. precision–recall; consider recalibration if p-values drift.")
+    else:
+        st.info("Incident trend is within tolerance; monitor exposure and downtime KPIs.")
+
+
+def render_insights(metrics: dict, role: str, thr: float, data_for_plots: pd.DataFrame):
     st.subheader("Insights")
-    c1, c2 = st.columns([1, 1])
+    persona_hint(role)
+
+    c1, c2 = st.columns([1,1])
     with c1:
         st.markdown("**Model performance**")
-        k = pd.DataFrame([
+        perf = pd.DataFrame([
             {"Metric": "AUC", "Value": round(metrics.get("auc", np.nan), 3)},
-            {"Metric": "Brier", "Value": 0.21},
+            {"Metric": "Brier", "Value": round(metrics.get("brier", np.nan), 3)},
             {"Metric": "Last training (s)", "Value": metrics.get("last_train_s", 0.0)},
+            {"Metric": "Version", "Value": metrics.get("version", "—")},
         ])
-        st.dataframe(k, hide_index=True, use_container_width=True)
-        st.button("Train / Retrain models", use_container_width=True)
+        st.dataframe(perf, hide_index=True, use_container_width=True)
+
+        # Threshold tuner (simulated P/R tradeoff)
+        st.markdown("**Threshold tuner (simulated)**")
+        t = st.slider("Decision threshold", 0.05, 0.95, float(thr), 0.01, key="tuner")
+        # Fake PR from beta curves
+        prec = max(0.1, 1 - (t*0.7))
+        rec = max(0.05, 0.95 - (t*0.9))
+        f1 = 2*prec*rec/(prec+rec)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Precision", f"{prec:.2f}")
+        m2.metric("Recall", f"{rec:.2f}")
+        m3.metric("F1", f"{f1:.2f}")
+
     with c2:
-        st.markdown("**Top features (global SHAP — placeholder)**")
-        # Simple bar placeholder
-        feat = pd.DataFrame({"feature": [f"f{i}" for i in range(10)], "mean_abs_shap": np.sort(np.random.rand(10))[::-1]})
-        fig = px.bar(feat, x="mean_abs_shap", y="feature", orientation="h", height=320)
-        fig.update_layout(margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("**Calibration & Confusion (placeholders)**")
+        # Reliability diagram (fake)
+        xs = np.linspace(0.01, 0.99, 10)
+        ys = np.clip(xs + np.random.normal(0, 0.04, len(xs)), 0, 1)
+        fig_cal = go.Figure()
+        fig_cal.add_trace(go.Scatter(x=xs, y=xs, mode='lines', name='Perfect'))
+        fig_cal.add_trace(go.Scatter(x=xs, y=ys, mode='lines+markers', name='Model'))
+        fig_cal.update_layout(title="Reliability", height=260, margin=dict(l=0,r=0,t=28,b=0))
+        st.plotly_chart(fig_cal, use_container_width=True)
+
+        # Confusion heatmap (fake)
+        labels = ["Normal", "Anomaly"]
+        mat = np.array([[70, 8],[12, 110]])
+        fig_cm = px.imshow(mat, x=labels, y=labels, text_auto=True, aspect='auto', title="Confusion matrix (val)")
+        fig_cm.update_layout(height=260, margin=dict(l=0,r=0,t=34,b=0))
+        st.plotly_chart(fig_cm, use_container_width=True)
+
+    st.markdown("**Top features (global importance — placeholder)**")
+    feat = pd.DataFrame({"feature": [f"f{i}" for i in range(12)], "mean_abs_shap": np.sort(np.random.rand(12))[::-1]})
+    fig = px.bar(feat, x="mean_abs_shap", y="feature", orientation="h", height=320)
+    fig.update_layout(margin=dict(l=0, r=0, t=10, b=0))
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.button("Train / Retrain models", use_container_width=True)
 
 
-def tab_governance(devices: pd.DataFrame, metrics: dict):
+def render_governance(devices: pd.DataFrame, metrics: dict, role: str):
     st.subheader("Governance")
-    card = {
-        "model": "LightGBM + Conformal",
-        "metrics": metrics,
-        "data": {
-            "entities": int(devices["device_id"].nunique()),
-            "synthetic": True,
-        },
-        "intended_use": "Anomaly detection demo for wireless/logistics telemetry",
-        "limitations": ["Synthetic data", "Not a safety control component"],
-    }
-    st.download_button("Download Model Card (JSON)", data=json.dumps(card, indent=2), file_name="model_card.json")
-    st.caption("Audit log and transparency artifacts can be added here.")
+    persona_hint(role)
 
+    c1, c2 = st.columns([1,1])
+    with c1:
+        st.markdown("**Model card (preview)**")
+        card = {
+            "model": "LightGBM + Conformal",
+            "version": metrics.get("version", "1.x"),
+            "metrics": {k: v for k, v in metrics.items() if k in ["auc", "brier"]},
+            "data": {"entities": int(devices["device_id"].nunique()), "synthetic": True},
+            "intended_use": "Anomaly detection demo for wireless/logistics telemetry",
+            "limitations": ["Synthetic data", "Not a safety control component"],
+        }
+        st.json(card)
+        st.download_button("Download Model Card (JSON)", data=json.dumps(card, indent=2), file_name="model_card.json")
+
+    with c2:
+        st.markdown("**Transparency & audit**")
+        checklist = pd.DataFrame({
+            "Item": [
+                "Data schema documented",
+                "Training config archived",
+                "Calibration evidence stored",
+                "Incident audit log enabled",
+                "Limitations communicated",
+            ],
+            "Status": ["Yes", "Yes", "Yes", "Yes", "Yes"],
+        })
+        st.dataframe(checklist, hide_index=True, use_container_width=True)
+
+        audit_rows = [
+            {"id": f"INC-{1000+i}", "device": f"dev_{i:03d}", "risk": round(np.random.uniform(0.7, 0.98),2), "type": np.random.choice(["Jamming","Access Breach","GPS Spoofing","Data Tamper"]) }
+            for i in range(8)
+        ]
+        st.markdown("**Recent audit log (sample)**")
+        st.dataframe(pd.DataFrame(audit_rows), hide_index=True, use_container_width=True)
+        st.download_button("Download Audit Log (CSV)", data=pd.DataFrame(audit_rows).to_csv(index=False), file_name="audit_log.csv")
+
+    st.markdown("**Risk policy (demo)**")
+    st.code("""
+# Decision policy (excerpt)
+IF conformal_p <= 0.10 AND risk >= 0.80 THEN severity = 'Critical' AND notify SOC
+ELIF conformal_p <= 0.25 AND risk >= 0.65 THEN severity = 'High' AND open ticket
+ELIF risk >= 0.50 THEN severity = 'Medium' ELSE 'Low'
+""", language="yaml")
+    st.caption("Export full policy and evidence bundles here in production.")
 
 # -------------------------
 # App Entry
@@ -282,25 +418,27 @@ def main():
     s = build_sidebar()
     header(s["role"])
     quick_help(s["help"])
-    compact_banners(s["eu"], s["scenario"])
+    compact_banners(s["eu"])
 
     devices = get_device_inventory()
-    incidents = get_incidents(devices, s["scenario"], s["thr"]) if s["thr"] is not None else pd.DataFrame()
+    full_df = get_incidents(devices, s["scenario"], s["thr"])  # includes non-incident rows too
     metrics = get_model_metrics(s["scenario"]) or {}
 
-    kpi_row(devices, incidents, metrics)
+    # Attach risk to devices for map coloring
+    devices = devices.merge(full_df[["device_id", "risk"]], on="device_id", how="left")
+
+    kpi_row(devices, full_df, metrics)
 
     tabs = st.tabs(["Overview", "Incidents", "Insights", "Governance"])
     with tabs[0]:
-        tab_overview(devices, incidents, s["show_map"])
+        render_overview(devices, full_df[full_df["is_incident"]], s["show_map"], s["show_heat"], s["role"])
     with tabs[1]:
-        tab_incidents(incidents)
+        render_incidents(full_df, s["thr"], s["role"])
     with tabs[2]:
-        tab_insights(metrics)
+        render_insights(metrics, s["role"], s["thr"], full_df)
     with tabs[3]:
-        tab_governance(devices, metrics)
+        render_governance(devices, metrics, s["role"])
 
-    # Optional auto stream tick (lightweight visual effect)
     if s["auto"]:
         time.sleep(0.8)
         st.experimental_rerun()
