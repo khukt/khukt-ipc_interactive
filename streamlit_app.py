@@ -28,7 +28,7 @@ class CFG:
     jam_radius_m: int = 220
     breach_radius_m: int = 180
     spoof_radius_m: int = 220
-    model_version: str = "demo-0.4.0"
+    model_version: str = "demo-0.4.1"
 
 random.seed(CFG.seed)
 np.random.seed(CFG.seed)
@@ -77,7 +77,7 @@ def inject_attack_risk(row, scenario, jam_mode, breach_mode, spoof_scope, radii)
         R = radii["jam"]; core_boost = 0.55 if jam_mode=="Broadband noise" else (0.6 if jam_mode=="Reactive" else 0.5)
         if dist_m <= R: prob = base + core_boost*(1 - dist_m/R) + np.random.uniform(0,0.1); pval = np.clip(0.02+0.03*(dist_m/R)+np.random.uniform(-0.01,0.02),0.0005,0.2)
     elif scenario.startswith("Access Breach"):
-        R = radii["breach"]; lure = 0.50 if breach_mode=="Evil Twin" else (0.40 if jam_mode!="Reactive" else 0.35)
+        R = radii["breach"]; lure = 0.50 if breach_mode=="Evil Twin" else (0.40 if breach_mode=="Rogue Open AP" else 0.35)
         expo = 1.0 if row["type"] in ["AMR","Truck"] else 0.7
         if dist_m <= R: prob = base + expo*lure*(1 - 0.6*(dist_m/R)) + np.random.uniform(0,0.08); pval = np.clip(0.03 + 0.05*(dist_m/R), 0.001, 0.3)
     elif scenario.startswith("GPS Spoofing"):
@@ -171,6 +171,9 @@ def init_state():
     ss.setdefault("gov_mc_done", False)
     ss.setdefault("gov_ds_done", False)
     ss.setdefault("gov_changes", [])
+    ss.setdefault("dpiamd_cached", "")
+    ss.setdefault("gov_sla_minutes", 10)
+    ss.setdefault("gov_sbom_text", "")
 
 def _init_gov_state():
     ss = st.session_state
@@ -200,8 +203,6 @@ def _init_gov_state():
         {"Role": "Admin", "Read Incidents": True, "Export": True, "Decide": True, "Admin": True},
     ]))
     ss.setdefault("gov_last_thresh", CFG.threshold)
-    ss.setdefault("gov_sla_minutes", 10)
-    ss.setdefault("gov_sbom_text", "")
 
 # ---------------- Sidebar ----------------
 st.set_page_config(page_title="TRUST DEMO", layout="wide")
@@ -459,7 +460,7 @@ with tab_governance:
         data_transparency += 25 if controls.get("privacy_by_design") else 0
         data_transparency += 25 if controls.get("traceability_audit") else 0
         pii_ratio = 0.0
-        if not di.empty and "PII" in di.columns: pii_ratio = (di["PII"].astype(str).str.lower()=="yes").mean()
+        if not di.empty and "PII" in di.columns: pii_ratio = (dii := di)["PII"].astype(str).str.lower().eq("yes").mean()
         data_transparency += 25 * (1 - pii_ratio)
         model_transparency = (35 if controls.get("transparency_cards") else 0) + (35 if controls.get("robustness_eval") else 0) + (30 if controls.get("lifecycle_mgmt") else 0)
         oversight = (50 if controls.get("human_oversight") else 0) + (50 if not al.empty else 0)
@@ -503,14 +504,14 @@ with tab_governance:
             enabled = sum(1 for v in ss.gov_controls.values() if v); disabled = len(ss.gov_controls) - enabled
             st.plotly_chart(px.bar(pd.DataFrame({"Status":["Enabled","Disabled"],"Count":[enabled,disabled]}),
                                    x="Status", y="Count", title="Controls coverage"), use_container_width=True)
-        # SLA compliance for human oversight
-        ss.gov_sla_minutes = st.slider("Decision SLA (minutes)", 1, 120, ss.gov_sla_minutes, 1, key="gov_sla_minutes")
+        # SLA compliance for human oversight (FIXED: use local var, not session assignment)
+        sla_minutes = st.slider("Decision SLA (minutes)", 1, 120, ss.gov_sla_minutes, 1, key="gov_sla_minutes")
         al_df = pd.DataFrame(st.session_state.audit_log); di_df = pd.DataFrame(st.session_state.incidents)
         if not al_df.empty and not di_df.empty:
             latest = al_df.sort_values("decided_at").groupby("incident_id").tail(1)
             j = latest.merge(di_df[["id","tick"]], left_on="incident_id", right_on="id", how="left")
             j["latency_min"] = (pd.to_datetime(j["decided_at"]) - pd.to_datetime(j["tick"])).dt.total_seconds()/60.0
-            sla_ok = (j["latency_min"] <= ss.gov_sla_minutes).mean() if len(j) else np.nan
+            sla_ok = (j["latency_min"] <= sla_minutes).mean() if len(j) else np.nan
             st.metric("SLA compliance", f"{(sla_ok*100):.0f}%" if sla_ok==sla_ok else "—")
             st.plotly_chart(px.histogram(j, x="latency_min", nbins=20, title="Decision latency distribution (min)"),
                             use_container_width=True)
@@ -547,7 +548,7 @@ with tab_governance:
                                   go.Bar(name="Recommended", x=rec_df["Artifact"], y=rec_df["Recommended"])])
         fig_ret.update_layout(barmode="group", title="Retention: configured vs recommended")
         st.plotly_chart(fig_ret, use_container_width=True)
-        # DPIA draft
+        # DPIA draft (cache for ZIP)
         dpiamd = f"""# DPIA (Draft Template)
 **Scope**: Site anomaly screening (RF, access, GNSS, integrity).
 **Controller**: Your Org • **Model version**: {CFG.model_version}
@@ -558,6 +559,7 @@ with tab_governance:
 **Rights & safeguards**: Access, rectification, deletion; privacy by design; pseudonymization: {"ON" if ss.gov_pseudonymization else "OFF"}.
 """
         _download_bytes(dpiamd, "DPIA_draft.md", "⬇️ Download DPIA (draft)", key="dl_dpia")
+        ss.dpiamd_cached = dpiamd
         # ROPA
         st.markdown("#### ROPA (Record of Processing Activities)")
         ropa = {
@@ -684,12 +686,24 @@ with tab_governance:
         with st.expander("Checklist details"):
             for k,v in items.items(): st.write(f"- [{'x' if v else ' '}] {k}")
 
-        # One-click Regulatory Report (ZIP)
+        # One-click Regulatory Report (ZIP) — build contents locally (no cross-scope vars)
         st.markdown("### Regulatory Report (ZIP)")
-        # Compose artifacts
-        dpiamd_txt = ss.get("dpiamd_cached") or ""  # optional
-        mc_txt = f"# Model Card — TRUST DEMO\n\nVersion: {CFG.model_version}\n\n" + ""  # we already have mc above
-        ds_txt = "# Datasheet — Telemetry (synthetic)\n\n(see datasheet export above)\n"
+        mc_txt = f"""# Model Card — TRUST DEMO
+Version: {CFG.model_version}
+Intended use: Site-level anomaly screening; advisory only.
+Limits: Not for autonomous enforcement or user surveillance.
+Known failure modes: RF congestion; unknown attack classes.
+Evaluation: Threshold-based; qualitative expert review.
+Ethical considerations: Human-in-the-loop; transparency; contestability.
+"""
+        ds_txt = """# Datasheet — Telemetry (synthetic)
+Composition: Synthetic RF/access/GNSS/integrity proxies.
+Collection: Procedural generation; no user data.
+Preprocessing: Normalization & signal proxies.
+Uses: Demo/training of anomaly screens.
+Distribution: Internal demo only.
+"""
+        dpiamd_txt = ss.get("dpiamd_cached") or "# DPIA (Draft)\n\n(Generate a fresh DPIA from Data & Privacy tab)"
         rr_csv = ss.gov_risk_register.to_csv(index=False) if not ss.gov_risk_register.empty else ""
         incidents_json = di_all.to_json(orient="records", indent=2, date_format="iso") if not di_all.empty else "[]"
         audit_json = al_all.to_json(orient="records", indent=2, date_format="iso") if not al_all.empty else "[]"
@@ -705,9 +719,9 @@ with tab_governance:
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("model_card.md", mc)
-            z.writestr("datasheet.md", ds)
-            z.writestr("DPIA_draft.md", dpiamd)
+            z.writestr("model_card.md", mc_txt)
+            z.writestr("datasheet.md", ds_txt)
+            z.writestr("DPIA_draft.md", dpiamd_txt)
             z.writestr("risk_register.csv", rr_csv)
             z.writestr("incidents.json", incidents_json)
             z.writestr("audit_log.json", audit_json)
